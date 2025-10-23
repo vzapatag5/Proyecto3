@@ -1,0 +1,8 @@
+# Compilados y binarios
+*.o
+gsea
+# Archivos temporales
+*.swp
+*.tmp
+# Salidas
+out/
