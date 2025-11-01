@@ -63,6 +63,7 @@ static void print_help(void) {
 /* Forzar salida en tests/ */
 static int  ensure_tests_dir(void);
 static char* build_tests_output_path(const char* out_path);
+static char* join2(const char* a, const char* b); /* <-- prototipo añadido aquí */
 
 /* Quita slashes finales de una ruta y devuelve una copia (malloc). */
 static char* trim_trailing_slashes(const char* p) {
@@ -77,6 +78,7 @@ static char* trim_trailing_slashes(const char* p) {
     return s;
 }
 
+// Asegura que el directorio tests/ exista
 static int ensure_tests_dir(void) {
     struct stat st;
     if (stat("tests", &st) == 0) {
@@ -91,63 +93,61 @@ static int ensure_tests_dir(void) {
 }
 
 /* tests/<basename(out_path)> */
+// Si out_path ya empieza con tests/, devolver tal cual
 static char* build_tests_output_path(const char* out_path) {
     /* Recorta slashes finales para que -o "outdir/" => basename "outdir" */
     char* out_trim = trim_trailing_slashes(out_path);
     if (!out_trim) return NULL;
 
-    const char* base = strrchr(out_trim, '/');
-#ifdef _WIN32
-    const char* b2 = strrchr(out_trim, '\\');
-    if (!base || (b2 && b2 > base)) base = b2;
-#endif
-    base = base ? base + 1 : out_trim;
-    if (*base == '\0') base = "out"; /* fallback por si queda vacío */
+    /* Si ya es tests/... devolvemos tal cual (evita "tests/tests/...") */
+    if (strncmp(out_trim, "tests/", 6) == 0 || strcmp(out_trim, "tests") == 0) {
+        char* dup = strdup(out_trim);
+        free(out_trim);
+        return dup;
+    }
 
-    size_t need = strlen("tests/") + strlen(base) + 1;
-    char* dst = (char*)malloc(need);
-    if (!dst) { free(out_trim); return NULL; }
-    strcpy(dst, "tests/");
-    strcat(dst, base);
+    /* Si es ruta absoluta, mantenemos el comportamiento antiguo (solo basename)
+       para evitar crear fuera de tests/. */
+    if (out_trim[0] == '/') {
+        const char* base = strrchr(out_trim, '/');
+    #ifdef _WIN32
+        const char* b2 = strrchr(out_trim, '\\');
+        if (!base || (b2 && b2 > base)) base = b2;
+    #endif
+        base = base ? base + 1 : out_trim;
+        if (*base == '\0') base = "out"; /* fallback por si queda vacío */
+
+        size_t need = strlen("tests/") + strlen(base) + 1;
+        char* dst = (char*)malloc(need);
+        if (!dst) { free(out_trim); return NULL; }
+        strcpy(dst, "tests/");
+        strcat(dst, base);
+        free(out_trim);
+        return dst;
+    }
+
+    /* Ruta relativa (no empieza con tests/): preservamos subdirectorios bajo tests/ */
+    char* dst = join2("tests", out_trim);
     free(out_trim);
     return dst;
 }
 
+// Comprueba si path es un directorio
 static int is_dir(const char* path) {
     struct stat st;
     if (stat(path, &st) != 0) return 0;
     return S_ISDIR(st.st_mode);
 }
 
+// Comprueba si path es un archivo regular
 static int is_regular(const char* path) {
     struct stat st;
     if (stat(path, &st) != 0) return 0;
     return S_ISREG(st.st_mode);
 }
 
-/* mkdir -p */
-static int mkdirs(const char* path, mode_t mode) {
-    if (!path || !*path) return -1;
-    char* tmp = strdup(path);
-    if (!tmp) return -1;
-
-    size_t len = strlen(tmp);
-    if (len == 0) { free(tmp); return -1; }
-    if (tmp[len-1] == '/') tmp[len-1] = '\0';
-
-    for (char* p = tmp + 1; *p; ++p) {
-        if (*p == '/') {
-            *p = '\0';
-            if (mkdir(tmp, mode) != 0 && errno != EEXIST) { free(tmp); return -1; }
-            *p = '/';
-        }
-    }
-    if (mkdir(tmp, mode) != 0 && errno != EEXIST) { free(tmp); return -1; }
-    free(tmp);
-    return 0;
-}
-
 /* Une rutas con '/' (malloc) */
+// Ejemplo: join2("a/b", "c/d") => "a/b/c/d"
 static char* join2(const char* a, const char* b) {
     if (!a || !b) return NULL;
     size_t na = strlen(a), nb = strlen(b);
@@ -161,7 +161,44 @@ static char* join2(const char* a, const char* b) {
     return s;
 }
 
+/* mkdir -p */
+static int mkdirs(const char* path, mode_t mode) {
+    if (!path || !*path) return -1;
+
+    /* Si la ruta comienza por "data" (p.ej. "data" o "data/...") y no está ya
+       dentro de tests/, reescribimos a "tests/<ruta>" */
+    const char* use_path = path;
+    char* prepended = NULL;
+    if ((strncmp(path, "data", 4) == 0) && (path[4] == '/' || path[4] == '\0')) {
+        if (strncmp(path, "tests/", 6) != 0) {
+            prepended = join2("tests", path);
+            if (!prepended) return -1;
+            use_path = prepended;
+        }
+    }
+
+    char* tmp = strdup(use_path);
+    if (!tmp) { free(prepended); return -1; }
+
+    size_t len = strlen(tmp);
+    if (len == 0) { free(tmp); free(prepended); return -1; }
+    if (tmp[len-1] == '/') tmp[len-1] = '\0';
+
+    for (char* p = tmp + 1; *p; ++p) {
+        if (*p == '/') {
+            *p = '\0';
+            if (mkdir(tmp, mode) != 0 && errno != EEXIST) { free(tmp); free(prepended); return -1; }
+            *p = '/';
+        }
+    }
+    if (mkdir(tmp, mode) != 0 && errno != EEXIST) { free(tmp); free(prepended); return -1; }
+    free(tmp);
+    free(prepended);
+    return 0;
+}
+
 /* Ruta absoluta simple */
+// Si p es relativa, la convierte a absoluta usando getcwd()
 static char* to_abs(const char* p) {
     if (!p) return NULL;
     if (p[0] == '/') return strdup(p);
@@ -171,6 +208,7 @@ static char* to_abs(const char* p) {
 }
 
 /* tests/<basename(out_root)>/<relpath>, relpath = in_abs - prefijo in_root_abs */
+// Ejemplo: in_abs="/home/user/data/a/b.txt", in_root_abs="/home/user/data", out_root="outdir"
 static char* out_path_for(const char* in_abs, const char* in_root_abs, const char* out_root) {
     if (ensure_tests_dir() != 0) return NULL;
 

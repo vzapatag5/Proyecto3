@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <errno.h>
 
+// Lee todo el contenido de un archivo en un buffer (malloc)
 int read_file(const char* path, uint8_t** out_buf, size_t* out_len) {
     if (!path || !out_buf || !out_len) return -1;
     *out_buf = NULL; *out_len = 0;
@@ -35,6 +36,7 @@ int read_file(const char* path, uint8_t** out_buf, size_t* out_len) {
     return 0;
 }
 
+// Escribe todo el contenido de un buffer en un archivo (crea/trunca)
 int write_file(const char* path, const uint8_t* buf, size_t len) {
     if (!path || (!buf && len>0)) return -1;
 
