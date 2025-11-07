@@ -13,13 +13,22 @@
 #include "fs.h"
 #include "rle_var.h"
 #include "vigenere.h"
+#include "image_png.h"
+#include "image_jpeg.h"
+#include "lzw.h"
+
+/* Contenedor / formatos usados por el pipeline */
+#define MAGIC_HDR     "GSEAIMG1"
+#define MAGIC_HDR_LEN 8
+#define FMT_PNG  1
+#define FMT_JPEG 2
 
 /* Evita warnings en algunos entornos */
 extern int optind;
 extern char *optarg;
 
 /* Algoritmos soportados */
-typedef enum { COMP_RLEVAR } CompAlg;
+typedef enum { COMP_RLEVAR, COMP_LZW, COMP_LZWPRED } CompAlg;
 typedef enum { ENC_NONE, ENC_VIG } EncAlg;
 
 /* Config CLI */
@@ -64,6 +73,7 @@ static void print_help(void) {
 static int  ensure_tests_dir(void);
 static char* build_tests_output_path(const char* out_path);
 static char* join2(const char* a, const char* b); /* <-- prototipo añadido aquí */
+static int run_interactive(void); /* forward prototype for interactive menu */
 
 /* Quita slashes finales de una ruta y devuelve una copia (malloc). */
 static char* trim_trailing_slashes(const char* p) {
@@ -266,6 +276,10 @@ static int parse_args(int argc, char* argv[], Config* cfg) {
             case 1: /* --comp-alg */
                 if (strcmp(optarg, "rlevar") == 0) {
                     cfg->comp_alg = COMP_RLEVAR;
+                } else if (strcmp(optarg, "lzw") == 0) {
+                    cfg->comp_alg = COMP_LZW;
+                } else if (strcmp(optarg, "lzw-pred") == 0) {
+                    cfg->comp_alg = COMP_LZWPRED;
                 } else {
                     fprintf(stderr, "Algoritmo de compresión desconocido: %s\n", optarg);
                     return -1;
@@ -304,7 +318,45 @@ static int parse_args(int argc, char* argv[], Config* cfg) {
     return 0;
 }
 
-/* ---------- Pipeline para UN archivo ---------- */
+/* ---------- Pipeline para UN archivo (reemplaza la versión previa) ---------- */
+/* Predictor (Sub) used before LZW to decorrelate pixels horizontally.
+ * in-place transform: for each row, for each channel, out = cur - left (left is previous original channel value), left updated to original
+ */
+static void apply_predictor_sub(uint8_t* buf, int w, int h, int ch) {
+    if (!buf || w <= 0 || h <= 0 || ch <= 0) return;
+    for (int y = 0; y < h; ++y) {
+        size_t row_off = (size_t)y * w * ch;
+        /* left values per channel */
+        uint8_t left[4] = {0,0,0,0};
+        for (int x = 0; x < w; ++x) {
+            for (int c = 0; c < ch; ++c) {
+                size_t idx = row_off + (size_t)x * ch + c;
+                uint8_t cur = buf[idx];
+                uint8_t pred = (uint8_t)(cur - left[c]);
+                buf[idx] = pred;
+                left[c] = cur;
+            }
+        }
+    }
+}
+
+static void undo_predictor_sub(uint8_t* buf, int w, int h, int ch) {
+    if (!buf || w <= 0 || h <= 0 || ch <= 0) return;
+    for (int y = 0; y < h; ++y) {
+        size_t row_off = (size_t)y * w * ch;
+        uint8_t left[4] = {0,0,0,0};
+        for (int x = 0; x < w; ++x) {
+            for (int c = 0; c < ch; ++c) {
+                size_t idx = row_off + (size_t)x * ch + c;
+                uint8_t pred = buf[idx];
+                uint8_t orig = (uint8_t)(pred + left[c]);
+                buf[idx] = orig;
+                left[c] = orig;
+            }
+        }
+    }
+}
+
 static int process_one_file(const char* in_path, const char* out_path, const Config* cfg) {
     uint8_t* buf = NULL; size_t len = 0;
     if (read_file(in_path, &buf, &len) != 0) {
@@ -314,14 +366,83 @@ static int process_one_file(const char* in_path, const char* out_path, const Con
 
     uint8_t* tmp = NULL; size_t tlen = 0;
 
+    int img_w=0,img_h=0,img_ch=0;
+    int was_image_input = 0;     /* entrada original era imagen (png/jpeg) */
+    int img_fmt = 0;            /* FMT_PNG / FMT_JPEG if image input */
+    int was_container = 0;      /* entrada era nuestro contenedor */
+    int will_write_container = 0;
+    int will_reconstruct_image = 0;
+
+    /* 1) Detectar contenedor propio (plaintext header)
+       Header: MAGIC(8) | fmt(1) | channels(1) | width(4 BE) | height(4 BE) */
+    if (len >= (size_t)(MAGIC_HDR_LEN + 1 + 1 + 4 + 4) && memcmp(buf, MAGIC_HDR, MAGIC_HDR_LEN) == 0) {
+        was_container = 1;
+        uint8_t fmt = (uint8_t)buf[MAGIC_HDR_LEN];
+        uint8_t ch  = (uint8_t)buf[MAGIC_HDR_LEN+1];
+        uint32_t w = (uint32_t)((buf[MAGIC_HDR_LEN+2]<<24) | (buf[MAGIC_HDR_LEN+3]<<16) | (buf[MAGIC_HDR_LEN+4]<<8) | (buf[MAGIC_HDR_LEN+5]));
+        uint32_t h = (uint32_t)((buf[MAGIC_HDR_LEN+6]<<24) | (buf[MAGIC_HDR_LEN+7]<<16) | (buf[MAGIC_HDR_LEN+8]<<8) | (buf[MAGIC_HDR_LEN+9]));
+        img_fmt = (int)fmt;
+        img_ch = (int)ch;
+        img_w = (int)w; img_h = (int)h;
+        size_t payload_off = MAGIC_HDR_LEN + 1 + 1 + 4 + 4;
+        size_t payload_len = len - payload_off;
+        uint8_t* payload = (uint8_t*)malloc(payload_len ? payload_len : 1);
+        if (!payload) { free(buf); return -1; }
+        memcpy(payload, buf + payload_off, payload_len);
+        free(buf); buf = payload; len = payload_len;
+        will_reconstruct_image = 1;
+    } else {
+        /* 2) Detectar por firma si es PNG o JPEG y sólo entonces llamar al decoder
+           Esto evita que las libs impriman errores cuando intentan decodificar bytes no correspondientes. */
+        uint8_t* pixels = NULL; size_t pixels_len = 0;
+        int w=0,h=0,ch=0;
+
+        /* PNG signature: 89 50 4E 47 0D 0A 1A 0A */
+        const unsigned char png_sig[8] = {137,80,78,71,13,10,26,10};
+        if (len >= 8 && memcmp(buf, png_sig, 8) == 0) {
+            if (png_decode_image(buf, len, &pixels, &pixels_len, &w, &h, &ch) == 0) {
+                free(buf);
+                buf = pixels; len = pixels_len;
+                img_w = w; img_h = h; img_ch = ch;
+                was_image_input = 1; img_fmt = FMT_PNG;
+                if (cfg->do_c || cfg->do_e) will_write_container = 1;
+            } else {
+                fprintf(stderr, "Advertencia: PNG detectado pero no pudo decodificarse (archivo corrupto?). Tratando como bytes crudos.\n");
+            }
+        } else if (len >= 3 && buf[0] == 0xFF && buf[1] == 0xD8 && buf[2] == 0xFF) {
+            if (jpeg_decode_image(buf, len, &pixels, &pixels_len, &w, &h, &ch) == 0) {
+                free(buf);
+                buf = pixels; len = pixels_len;
+                img_w = w; img_h = h; img_ch = ch;
+                was_image_input = 1; img_fmt = FMT_JPEG;
+                if (cfg->do_c || cfg->do_e) will_write_container = 1;
+            } else {
+                fprintf(stderr, "Advertencia: JPEG detectado pero no pudo decodificarse (archivo corrupto?). Tratando como bytes crudos.\n");
+            }
+        } else {
+            /* No es PNG ni JPEG por firma -> tratamos como fichero binario */
+        }
+    }
+
     /* FORWARD */
     if (cfg->do_c) {
         if (cfg->comp_alg == COMP_RLEVAR) {
-            if (rle_var_compress(buf, len, &tmp, &tlen) != 0) {
-                puts("RLE-Var: compresión falló");
-                free(buf); return -1;
-            }
+            if (rle_var_compress(buf, len, &tmp, &tlen) != 0) { puts("RLE-Var: compresión falló"); free(buf); return -1; }
             free(buf); buf = tmp; len = tlen;
+        } else if (cfg->comp_alg == COMP_LZW) {
+            if (lzw_compress(buf, len, &tmp, &tlen) != 0) { fprintf(stderr, "LZW: compresión falló\n"); free(buf); return -1; }
+            free(buf); buf = tmp; len = tlen;
+        } else if (cfg->comp_alg == COMP_LZWPRED) {
+            /* predictor only makes sense for decoded images */
+            if (was_image_input && img_w > 0 && img_h > 0 && img_ch > 0) {
+                apply_predictor_sub(buf, img_w, img_h, img_ch);
+                if (lzw_compress(buf, len, &tmp, &tlen) != 0) { fprintf(stderr, "LZW-PRED: compresión falló\n"); free(buf); return -1; }
+                free(buf); buf = tmp; len = tlen;
+            } else {
+                /* fallback to plain LZW on raw data */
+                if (lzw_compress(buf, len, &tmp, &tlen) != 0) { fprintf(stderr, "LZW: compresión falló\n"); free(buf); return -1; }
+                free(buf); buf = tmp; len = tlen;
+            }
         }
     }
     if (cfg->do_e) {
@@ -338,30 +459,95 @@ static int process_one_file(const char* in_path, const char* out_path, const Con
     }
     if (cfg->do_d) {
         if (cfg->comp_alg == COMP_RLEVAR) {
-            if (rle_var_decompress(buf, len, &tmp, &tlen) != 0) {
-                puts("RLE-Var: descompresión falló");
-                free(buf); return -1;
-            }
+            if (rle_var_decompress(buf, len, &tmp, &tlen) != 0) { puts("RLE-Var: descompresión falló"); free(buf); return -1; }
             free(buf); buf = tmp; len = tlen;
+        } else if (cfg->comp_alg == COMP_LZW || cfg->comp_alg == COMP_LZWPRED) {
+            if (lzw_decompress(buf, len, &tmp, &tlen) != 0) { fprintf(stderr, "LZW: descompresión falló\n"); free(buf); return -1; }
+            free(buf); buf = tmp; len = tlen;
+            /* if predictor was used, undo it now (only if we have image dimensions) */
+            if (cfg->comp_alg == COMP_LZWPRED && img_w > 0 && img_h > 0 && img_ch > 0) {
+                undo_predictor_sub(buf, img_w, img_h, img_ch);
+            }
         }
+    }
+
+    /* Si la entrada era contenedor propio y se hicieron las operaciones inversas,
+       reconstruir la imagen (encode según fmt almacenado) */
+    if (will_reconstruct_image) {
+        uint8_t* out_img = NULL; size_t out_img_len = 0;
+        int rc = -1;
+        if (img_fmt == FMT_PNG) {
+            rc = png_encode_image(buf, len, img_w, img_h, img_ch, &out_img, &out_img_len);
+        } else if (img_fmt == FMT_JPEG) {
+            /* jpeg_encode_image acepta sólo RGB (channels==3) */
+            if (img_ch == 4) {
+                /* strip alpha before JPEG encoding */
+                size_t pixels = (size_t)img_w * img_h;
+                uint8_t* rgb = (uint8_t*)malloc(pixels * 3);
+                if (rgb) {
+                    for (size_t i = 0; i < pixels; ++i) {
+                        rgb[i*3+0] = buf[i*4+0];
+                        rgb[i*3+1] = buf[i*4+1];
+                        rgb[i*3+2] = buf[i*4+2];
+                    }
+                    rc = jpeg_encode_image(rgb, pixels*3, img_w, img_h, 3, &out_img, &out_img_len);
+                    free(rgb);
+                }
+            } else {
+                rc = jpeg_encode_image(buf, len, img_w, img_h, img_ch, &out_img, &out_img_len);
+            }
+        }
+        if (rc == 0) {
+            free(buf);
+            buf = out_img; len = out_img_len;
+        } else {
+            /* si no se pudo re-encodear, dejamos buf tal cual */
+        }
+    }
+
+    /* Preparar buffer final para escribir: si debemos escribir contenedor (imagen -> contenedor),
+       construimos header (plaintext) + payload */
+    uint8_t* final_buf = NULL; size_t final_len = 0;
+    if (will_write_container) {
+        size_t hdr_len = MAGIC_HDR_LEN + 1 + 1 + 4 + 4;
+        final_len = hdr_len + len;
+        final_buf = (uint8_t*)malloc(final_len ? final_len : 1);
+        if (!final_buf) { free(buf); return -1; }
+        memcpy(final_buf, MAGIC_HDR, MAGIC_HDR_LEN);
+        final_buf[MAGIC_HDR_LEN] = (uint8_t)img_fmt;
+        final_buf[MAGIC_HDR_LEN+1] = (uint8_t)img_ch;
+        final_buf[MAGIC_HDR_LEN+2] = (uint8_t)((img_w >> 24) & 0xFF);
+        final_buf[MAGIC_HDR_LEN+3] = (uint8_t)((img_w >> 16) & 0xFF);
+        final_buf[MAGIC_HDR_LEN+4] = (uint8_t)((img_w >> 8) & 0xFF);
+        final_buf[MAGIC_HDR_LEN+5] = (uint8_t)(img_w & 0xFF);
+        final_buf[MAGIC_HDR_LEN+6] = (uint8_t)((img_h >> 24) & 0xFF);
+        final_buf[MAGIC_HDR_LEN+7] = (uint8_t)((img_h >> 16) & 0xFF);
+        final_buf[MAGIC_HDR_LEN+8] = (uint8_t)((img_h >> 8) & 0xFF);
+        final_buf[MAGIC_HDR_LEN+9] = (uint8_t)(img_h & 0xFF);
+        memcpy(final_buf + hdr_len, buf, len);
+    } else {
+        final_buf = buf;
+        final_len = len;
+        buf = NULL; /* transfer ownership */
     }
 
     /* Asegurar directorio destino y escribir */
     char* out_dir = strdup(out_path);
-    if (!out_dir) { free(buf); return -1; }
+    if (!out_dir) { free(final_buf); free(buf); return -1; }
     char* slash = strrchr(out_dir, '/');
     if (slash) {
         *slash = '\0';
-        if (mkdirs(out_dir, 0755) != 0) { perror("mkdirs"); free(out_dir); free(buf); return -1; }
+        if (mkdirs(out_dir, 0755) != 0) { perror("mkdirs"); free(out_dir); free(final_buf); free(buf); return -1; }
     }
     free(out_dir);
 
-    if (write_file(out_path, buf, len) != 0) {
+    if (write_file(out_path, final_buf, final_len) != 0) {
         fprintf(stderr, "write_file fallo: %s\n", out_path);
-        free(buf);
+        free(final_buf); free(buf);
         return -1;
     }
 
+    free(final_buf);
     free(buf);
     return 0;
 }
@@ -442,6 +628,11 @@ static int collect_files_recursive(const char* in_root_abs, const char* cur_abs,
 
 /* ---------- main ---------- */
 int main(int argc, char* argv[]) {
+    /* Si no se pasan argumentos, lanzar menú interactivo */
+    if (argc == 1) {
+        return run_interactive();
+    }
+
     Config cfg;
     if (parse_args(argc, argv, &cfg) != 0) { print_help(); return 1; }
 
@@ -531,3 +722,139 @@ int main(int argc, char* argv[]) {
     free(out_abs);
     return 0;
 }
+/* --------- Menú interactivo (invocado si argc==1) --------- */
+static char* prompt_line(const char* prompt) {
+    if (!prompt) prompt = "> ";
+    printf("%s", prompt);
+    fflush(stdout);
+    char buf[4096];
+    if (!fgets(buf, sizeof(buf), stdin)) return NULL;
+    size_t n = strlen(buf);
+    while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r')) { buf[--n] = '\0'; }
+    if (n == 0) return NULL;
+    return strdup(buf);
+}
+
+static int prompt_yesno(const char* prompt) {
+    char* r = prompt_line(prompt);
+    if (!r) return 0;
+    int ok = (r[0]=='y' || r[0]=='Y' || r[0]=='1');
+    free(r);
+    return ok;
+}
+
+static const char* choose_comp_alg_str(void) {
+    printf("Elige algoritmo de compresión:\n");
+    printf("  1) rlevar (default)\n");
+    printf("  2) lzw\n");
+    printf("  3) lzw-pred\n");
+    printf("Selecciona (1-3): ");
+    char buf[16];
+    if (!fgets(buf, sizeof(buf), stdin)) return "rlevar";
+    int v = atoi(buf);
+    if (v == 2) return "lzw";
+    if (v == 3) return "lzw-pred";
+    return "rlevar";
+}
+
+static const char* choose_enc_alg_str(void) {
+    printf("Elige algoritmo de cifrado:\n");
+    printf("  1) vigenere (default)\n");
+    printf("  2) none\n");
+    printf("Selecciona (1-2): ");
+    char buf[16];
+    if (!fgets(buf, sizeof(buf), stdin)) return "vigenere";
+    int v = atoi(buf);
+    if (v == 2) return "none";
+    return "vigenere";
+}
+
+static int run_interactive(void) {
+    puts("=== GSEA - modo interactivo ===");
+    char* in = prompt_line("Ruta de entrada (-i): ");
+    if (!in) { puts("Entrada inválida."); return 1; }
+    char* out = prompt_line("Ruta de salida (-o): ");
+    if (!out) { free(in); puts("Salida inválida."); return 1; }
+
+    int do_c = prompt_yesno("¿Comprimir? (y/N): ");
+    int do_d = 0;
+    int do_e = prompt_yesno("¿Encriptar? (y/N): ");
+    int do_u = 0;
+    if (!do_c && !do_e) {
+        puts("Ninguna operación seleccionada. Puedes combinar compresión (-c) y/o encriptado (-e).");
+    }
+
+    const char* comp_alg = choose_comp_alg_str();
+    const char* enc_alg = choose_enc_alg_str();
+
+    char* key = NULL;
+    if (strcmp(enc_alg, "vigenere") == 0 && do_e) {
+        key = prompt_line("Clave (para Vigenere) (-k): ");
+        if (!key) { puts("Clave vacía, abortando."); free(in); free(out); return 1; }
+    } else if (strcmp(enc_alg, "vigenere") == 0 && !do_e) {
+        /* si no se encripta pero usuario eligió algoritmo, no pedimos clave */
+    }
+
+    /* Construir comando seguro (escapamos comillas simples) */
+    char cmd[8192];
+    snprintf(cmd, sizeof(cmd), "./gsea");
+    if (do_c) strncat(cmd, " -c", sizeof(cmd)-strlen(cmd)-1);
+    if (do_d) strncat(cmd, " -d", sizeof(cmd)-strlen(cmd)-1);
+    if (do_e) strncat(cmd, " -e", sizeof(cmd)-strlen(cmd)-1);
+    if (do_u) strncat(cmd, " -u", sizeof(cmd)-strlen(cmd)-1);
+
+    char tmp[4096];
+    snprintf(tmp, sizeof(tmp), " --comp-alg %s", comp_alg);
+    strncat(cmd, tmp, sizeof(cmd)-strlen(cmd)-1);
+    snprintf(tmp, sizeof(tmp), " --enc-alg %s", enc_alg);
+    strncat(cmd, tmp, sizeof(cmd)-strlen(cmd)-1);
+
+    /* Añadir -i y -o (entre comillas simples, con escape de ' ) */
+    char in_esc[4096]={0}, out_esc[4096]={0};
+    size_t p=0;
+    in_esc[p++] = '\'';
+    for (size_t i=0;i<strlen(in) && p+2<sizeof(in_esc);++i) {
+        if (in[i]=='\'') { in_esc[p++]='\\'; in_esc[p++]='\''; } else in_esc[p++]=in[i];
+    }
+    in_esc[p++] = '\'';
+    in_esc[p]=0;
+    p=0;
+    out_esc[p++] = '\'';
+    for (size_t i=0;i<strlen(out) && p+2<sizeof(out_esc);++i) {
+        if (out[i]=='\'') { out_esc[p++]='\\'; out_esc[p++]='\''; } else out_esc[p++]=out[i];
+    }
+    out_esc[p++] = '\'';
+    out_esc[p]=0;
+
+    strncat(cmd, " -i ", sizeof(cmd)-strlen(cmd)-1);
+    strncat(cmd, in_esc, sizeof(cmd)-strlen(cmd)-1);
+    strncat(cmd, " -o ", sizeof(cmd)-strlen(cmd)-1);
+    strncat(cmd, out_esc, sizeof(cmd)-strlen(cmd)-1);
+
+    if (key && do_e) {
+        /* escapamos la clave de forma simple */
+        char kesc[1024] = {'\0'};
+        size_t kk=0; kesc[kk++] = '\'';
+        for (size_t i=0;i<strlen(key) && kk+2<sizeof(kesc);++i) {
+            if (key[i]=='\'') { kesc[kk++]='\\'; kesc[kk++]='\''; } else kesc[kk++]=key[i];
+        }
+        kesc[kk++] = '\''; kesc[kk]=0;
+        strncat(cmd, " -k ", sizeof(cmd)-strlen(cmd)-1);
+        strncat(cmd, kesc, sizeof(cmd)-strlen(cmd)-1);
+    }
+
+    printf("Comando a ejecutar:\n%s\n", cmd);
+    if (!prompt_yesno("Confirmar y ejecutar? (y/N): ")) {
+        puts("Cancelado.");
+        free(in); free(out); if (key) free(key);
+        return 0;
+    }
+
+    /* Ejecuta el mismo binario con las opciones seleccionadas */
+    int rc = system(cmd);
+    printf("Proceso finalizó con código %d\n", rc);
+
+    free(in); free(out); if (key) free(key);
+    return rc == -1 ? 1 : WEXITSTATUS(rc);
+}
+/* --------- fin menú interactivo --------- */
