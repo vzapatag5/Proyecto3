@@ -6,3 +6,7 @@ gsea
 *.tmp
 # Salidas
 out/
+
+#Archivos pesados que no soporta github
+tests/archivo.txt
+tests/noticia.txt

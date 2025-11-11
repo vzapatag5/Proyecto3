@@ -1,3 +1,5 @@
+#define _DEFAULT_SOURCE
+#define _POSIX_C_SOURCE 199309L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,9 +8,11 @@
 #include <getopt.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <errno.h>
 #include <dirent.h>
 #include <pthread.h>
+#include <time.h>      /* <-- añadido */
 
 #include "fs.h"
 #include "rle_var.h"
@@ -74,6 +78,7 @@ static int  ensure_tests_dir(void);
 static char* build_tests_output_path(const char* out_path);
 static char* join2(const char* a, const char* b); /* <-- prototipo añadido aquí */
 static int run_interactive(void); /* forward prototype for interactive menu */
+static char* prompt_line(const char* prompt);
 
 /* Quita slashes finales de una ruta y devuelve una copia (malloc). */
 static char* trim_trailing_slashes(const char* p) {
@@ -169,6 +174,64 @@ static char* join2(const char* a, const char* b) {
     if (need_slash) strcat(s, "/");
     strcat(s, b);
     return s;
+}
+
+/* Formatea un tamaño en bytes a forma legible (ej: 1.23MB) */
+static void human_readable(size_t bytes, char* out, size_t out_size) {
+    const char* units[] = {"B","KB","MB","GB","TB"};
+    double v = (double)bytes;
+    int u = 0;
+    while (v >= 1024.0 && u < 4) { v /= 1024.0; u++; }
+    snprintf(out, out_size, "%.2f%s", v, units[u]);
+}
+
+/* Escribe una cadena CSV entre comillas y escapando comillas internas duplicándolas */
+static void csv_quote(FILE* f, const char* s) {
+    fputc('"', f);
+    if (s) {
+        for (const char* p = s; *p; ++p) {
+            if (*p == '"') fputs("""", f); else fputc(*p, f);
+        }
+    }
+    fputc('"', f);
+}
+
+/* Predictor (Sub) used before LZW to decorrelate pixels horizontally.
+ * in-place transform: for each row, for each channel, out = cur - left (left is previous original channel value), left updated to original
+ */
+static void apply_predictor_sub(uint8_t* buf, int w, int h, int ch) {
+    if (!buf || w <= 0 || h <= 0 || ch <= 0) return;
+    for (int y = 0; y < h; ++y) {
+        size_t row_off = (size_t)y * w * ch;
+        /* left values per channel */
+        uint8_t left[4] = {0,0,0,0};
+        for (int x = 0; x < w; ++x) {
+            for (int c = 0; c < ch; ++c) {
+                size_t idx = row_off + (size_t)x * ch + c;
+                uint8_t cur = buf[idx];
+                uint8_t pred = (uint8_t)(cur - left[c]);
+                buf[idx] = pred;
+                left[c] = cur;
+            }
+        }
+    }
+}
+
+static void undo_predictor_sub(uint8_t* buf, int w, int h, int ch) {
+    if (!buf || w <= 0 || h <= 0 || ch <= 0) return;
+    for (int y = 0; y < h; ++y) {
+        size_t row_off = (size_t)y * w * ch;
+        uint8_t left[4] = {0,0,0,0};
+        for (int x = 0; x < w; ++x) {
+            for (int c = 0; c < ch; ++c) {
+                size_t idx = row_off + (size_t)x * ch + c;
+                uint8_t pred = buf[idx];
+                uint8_t orig = (uint8_t)(pred + left[c]);
+                buf[idx] = orig;
+                left[c] = orig;
+            }
+        }
+    }
 }
 
 /* mkdir -p */
@@ -318,61 +381,31 @@ static int parse_args(int argc, char* argv[], Config* cfg) {
     return 0;
 }
 
-/* ---------- Pipeline para UN archivo (reemplaza la versión previa) ---------- */
-/* Predictor (Sub) used before LZW to decorrelate pixels horizontally.
- * in-place transform: for each row, for each channel, out = cur - left (left is previous original channel value), left updated to original
- */
-static void apply_predictor_sub(uint8_t* buf, int w, int h, int ch) {
-    if (!buf || w <= 0 || h <= 0 || ch <= 0) return;
-    for (int y = 0; y < h; ++y) {
-        size_t row_off = (size_t)y * w * ch;
-        /* left values per channel */
-        uint8_t left[4] = {0,0,0,0};
-        for (int x = 0; x < w; ++x) {
-            for (int c = 0; c < ch; ++c) {
-                size_t idx = row_off + (size_t)x * ch + c;
-                uint8_t cur = buf[idx];
-                uint8_t pred = (uint8_t)(cur - left[c]);
-                buf[idx] = pred;
-                left[c] = cur;
-            }
-        }
-    }
-}
+/* ---------- Pipeline para UN archivo (ahora devuelve estadísticas) ---------- */
+static int process_one_file(const char* in_path, const char* out_path, const Config* cfg,
+                            size_t* out_orig_len, size_t* out_final_len, double* out_elapsed_ms) {
+    if (out_orig_len) *out_orig_len = 0;
+    if (out_final_len) *out_final_len = 0;
+    if (out_elapsed_ms) *out_elapsed_ms = 0.0;
 
-static void undo_predictor_sub(uint8_t* buf, int w, int h, int ch) {
-    if (!buf || w <= 0 || h <= 0 || ch <= 0) return;
-    for (int y = 0; y < h; ++y) {
-        size_t row_off = (size_t)y * w * ch;
-        uint8_t left[4] = {0,0,0,0};
-        for (int x = 0; x < w; ++x) {
-            for (int c = 0; c < ch; ++c) {
-                size_t idx = row_off + (size_t)x * ch + c;
-                uint8_t pred = buf[idx];
-                uint8_t orig = (uint8_t)(pred + left[c]);
-                buf[idx] = orig;
-                left[c] = orig;
-            }
-        }
-    }
-}
-
-static int process_one_file(const char* in_path, const char* out_path, const Config* cfg) {
     uint8_t* buf = NULL; size_t len = 0;
     if (read_file(in_path, &buf, &len) != 0) {
         fprintf(stderr, "read_file fallo: %s\n", in_path);
         return -1;
     }
+    size_t orig_len = len;
+    if (out_orig_len) *out_orig_len = orig_len;
 
     uint8_t* tmp = NULL; size_t tlen = 0;
 
     int img_w=0,img_h=0,img_ch=0;
     int was_image_input = 0;     /* entrada original era imagen (png/jpeg) */
     int img_fmt = 0;            /* FMT_PNG / FMT_JPEG if image input */
-    int was_container = 0;      /* entrada era nuestro contenedor */
+    int was_container = 0;
     int will_write_container = 0;
     int will_reconstruct_image = 0;
 
+    /* Detect container or decode images as before */
     /* 1) Detectar contenedor propio (plaintext header)
        Header: MAGIC(8) | fmt(1) | channels(1) | width(4 BE) | height(4 BE) */
     if (len >= (size_t)(MAGIC_HDR_LEN + 1 + 1 + 4 + 4) && memcmp(buf, MAGIC_HDR, MAGIC_HDR_LEN) == 0) {
@@ -424,6 +457,10 @@ static int process_one_file(const char* in_path, const char* out_path, const Con
         }
     }
 
+    /* Medir tiempo: desde justo antes de aplicar FORWARD hasta que termina escribir */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
     /* FORWARD */
     if (cfg->do_c) {
         if (cfg->comp_alg == COMP_RLEVAR) {
@@ -433,13 +470,11 @@ static int process_one_file(const char* in_path, const char* out_path, const Con
             if (lzw_compress(buf, len, &tmp, &tlen) != 0) { fprintf(stderr, "LZW: compresión falló\n"); free(buf); return -1; }
             free(buf); buf = tmp; len = tlen;
         } else if (cfg->comp_alg == COMP_LZWPRED) {
-            /* predictor only makes sense for decoded images */
             if (was_image_input && img_w > 0 && img_h > 0 && img_ch > 0) {
                 apply_predictor_sub(buf, img_w, img_h, img_ch);
                 if (lzw_compress(buf, len, &tmp, &tlen) != 0) { fprintf(stderr, "LZW-PRED: compresión falló\n"); free(buf); return -1; }
                 free(buf); buf = tmp; len = tlen;
             } else {
-                /* fallback to plain LZW on raw data */
                 if (lzw_compress(buf, len, &tmp, &tlen) != 0) { fprintf(stderr, "LZW: compresión falló\n"); free(buf); return -1; }
                 free(buf); buf = tmp; len = tlen;
             }
@@ -464,24 +499,21 @@ static int process_one_file(const char* in_path, const char* out_path, const Con
         } else if (cfg->comp_alg == COMP_LZW || cfg->comp_alg == COMP_LZWPRED) {
             if (lzw_decompress(buf, len, &tmp, &tlen) != 0) { fprintf(stderr, "LZW: descompresión falló\n"); free(buf); return -1; }
             free(buf); buf = tmp; len = tlen;
-            /* if predictor was used, undo it now (only if we have image dimensions) */
-            if (cfg->comp_alg == COMP_LZWPRED && img_w > 0 && img_h > 0 && img_ch > 0) {
-                undo_predictor_sub(buf, img_w, img_h, img_ch);
-            }
+        }
+        /* si usaste predictor, deshacerlo ya estaba implementado en tu flujo original */
+        if (cfg->comp_alg == COMP_LZWPRED && img_w > 0 && img_h > 0 && img_ch > 0) {
+            undo_predictor_sub(buf, img_w, img_h, img_ch);
         }
     }
 
-    /* Si la entrada era contenedor propio y se hicieron las operaciones inversas,
-       reconstruir la imagen (encode según fmt almacenado) */
+    /* Si era contenedor propio y toca reconstruir imagen */
     if (will_reconstruct_image) {
         uint8_t* out_img = NULL; size_t out_img_len = 0;
         int rc = -1;
         if (img_fmt == FMT_PNG) {
             rc = png_encode_image(buf, len, img_w, img_h, img_ch, &out_img, &out_img_len);
         } else if (img_fmt == FMT_JPEG) {
-            /* jpeg_encode_image acepta sólo RGB (channels==3) */
             if (img_ch == 4) {
-                /* strip alpha before JPEG encoding */
                 size_t pixels = (size_t)img_w * img_h;
                 uint8_t* rgb = (uint8_t*)malloc(pixels * 3);
                 if (rgb) {
@@ -500,13 +532,10 @@ static int process_one_file(const char* in_path, const char* out_path, const Con
         if (rc == 0) {
             free(buf);
             buf = out_img; len = out_img_len;
-        } else {
-            /* si no se pudo re-encodear, dejamos buf tal cual */
         }
     }
 
-    /* Preparar buffer final para escribir: si debemos escribir contenedor (imagen -> contenedor),
-       construimos header (plaintext) + payload */
+    /* Preparar final_buf como antes (contenedor o bruto) */
     uint8_t* final_buf = NULL; size_t final_len = 0;
     if (will_write_container) {
         size_t hdr_len = MAGIC_HDR_LEN + 1 + 1 + 4 + 4;
@@ -531,7 +560,7 @@ static int process_one_file(const char* in_path, const char* out_path, const Con
         buf = NULL; /* transfer ownership */
     }
 
-    /* Asegurar directorio destino y escribir */
+    /* Escribir y medir fin */
     char* out_dir = strdup(out_path);
     if (!out_dir) { free(final_buf); free(buf); return -1; }
     char* slash = strrchr(out_dir, '/');
@@ -541,7 +570,14 @@ static int process_one_file(const char* in_path, const char* out_path, const Con
     }
     free(out_dir);
 
-    if (write_file(out_path, final_buf, final_len) != 0) {
+    int wres = write_file(out_path, final_buf, final_len);
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    if (out_elapsed_ms) *out_elapsed_ms = elapsed_ms;
+    if (out_final_len) *out_final_len = final_len;
+
+    if (wres != 0) {
         fprintf(stderr, "write_file fallo: %s\n", out_path);
         free(final_buf); free(buf);
         return -1;
@@ -558,11 +594,15 @@ typedef struct {
     char* out_path;
     const Config* cfg;  // solo lectura
     int result;         // 0 ok, !=0 error
+    size_t orig_len;    // bytes antes de procesar
+    size_t final_len;   // bytes escritos (final)
+    double elapsed_ms;  // tiempo en ms que tardó el proceso (incluye I/O y processing)
 } Task;
 
 static void* thread_routine(void* arg) {
     Task* t = (Task*)arg;
-    t->result = process_one_file(t->in_path, t->out_path, t->cfg);
+    t->orig_len = 0; t->final_len = 0; t->elapsed_ms = 0.0;
+    t->result = process_one_file(t->in_path, t->out_path, t->cfg, &t->orig_len, &t->final_len, &t->elapsed_ms);
     return NULL;
 }
 
@@ -659,9 +699,35 @@ int main(int argc, char* argv[]) {
             free(in_abs); free(out_abs); return 1;
         }
 
-        if (process_one_file(in_abs, tests_out, &cfg) != 0) {
+        size_t orig_len = 0, final_len = 0;
+        double elapsed_ms = 0.0;
+        if (process_one_file(in_abs, tests_out, &cfg, &orig_len, &final_len, &elapsed_ms) != 0) {
             free(tests_out); free(in_abs); free(out_abs); return 1;
         }
+
+     printf("\nArchivo                                   | orig (bytes)     | final (bytes)    | ahorro(%%) | tiempo (ms)\n");
+     printf("--------------------------------------------------------------------------------------------------------\n");
+     char orig_hr[32] = {0}, final_hr[32] = {0};
+     human_readable(orig_len, orig_hr, sizeof(orig_hr));
+     human_readable(final_len, final_hr, sizeof(final_hr));
+     double ahorro = 0.0;
+     if (orig_len > 0) ahorro = (1.0 - (double)final_len / (double)orig_len) * 100.0;
+        /* Mostrar una ruta corta: preferir 'tests/...' si aparece, si no, usar basename */
+        const char* show_path = in_abs;
+        const char* tpos = strstr(in_abs, "/tests/");
+        if (!tpos) tpos = strstr(in_abs, "tests/");
+        if (tpos) {
+            if (*tpos == '/') tpos++; /* quitar el slash inicial */
+            show_path = tpos;
+        } else {
+            /* fallback: basename del archivo para no imprimir ruta completa */
+            const char* base = strrchr(in_abs, '/');
+            show_path = base ? (base + 1) : in_abs;
+        }
+     printf("%-41s | %12zu (%6s) | %13zu (%6s) | %7.2f%% | %10.3f\n",
+         show_path, orig_len, orig_hr, final_len, final_hr, ahorro, elapsed_ms);
+     printf("--------------------------------------------------------------------------------------------------------\n");
+
         printf("Listo ✅ -> %s\n", tests_out);
         free(tests_out);
     } else {
@@ -695,15 +761,68 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        /* esperar workers */
+        for (size_t i=0; i<pl.count; ++i) pthread_join(tids[i], NULL);
+
+        /* imprimir tabla de resultados (con tamaños legibles y ahorro %) y exportar CSV */
+        printf("\nArchivo                                   | orig (bytes)     | final (bytes)    | ahorro(%%) | tiempo (ms)\n");
+        printf("--------------------------------------------------------------------------------------------------------\n");
         int global_status = 0;
+        size_t total_orig = 0, total_final = 0;
+        double total_ms = 0.0;
+
+        /* preparar CSV de salida */
+        const char* csv_path = "tests/gsea_results.csv";
+        FILE* csv = fopen(csv_path, "w");
+        if (!csv) {
+            fprintf(stderr, "Advertencia: no se pudo abrir %s para escritura (no se exportará CSV)\n", csv_path);
+        } else {
+            fprintf(csv, "archivo,orig_bytes,orig_hr,final_bytes,final_hr,ahorro_pct,tiempo_ms\n");
+        }
+
         for (size_t i=0; i<pl.count; ++i) {
-            pthread_join(tids[i], NULL);
             if (tasks[i].result != 0) {
                 fprintf(stderr, "ERROR en: %s -> %s\n", tasks[i].in_path, tasks[i].out_path);
                 global_status = 1;
-            } else {
-                printf("OK: %s -> %s\n", tasks[i].in_path, tasks[i].out_path);
             }
+            char orig_hr[32] = {0}, final_hr[32] = {0};
+            human_readable(tasks[i].orig_len, orig_hr, sizeof(orig_hr));
+            human_readable(tasks[i].final_len, final_hr, sizeof(final_hr));
+            double ahorro = 0.0;
+            if (tasks[i].orig_len) ahorro = (1.0 - (double)tasks[i].final_len / (double)tasks[i].orig_len) * 100.0;
+            printf("%-41s | %12zu (%6s) | %13zu (%6s) | %7.2f%% | %10.3f\n",
+                   pl.in_paths[i],
+                   tasks[i].orig_len, orig_hr,
+                   tasks[i].final_len, final_hr,
+                   ahorro,
+                   tasks[i].elapsed_ms);
+
+            if (csv) {
+                csv_quote(csv, pl.in_paths[i]); fprintf(csv, ",");
+                fprintf(csv, "%zu,%s,%zu,%s,%.2f,%.3f\n",
+                        tasks[i].orig_len, orig_hr,
+                        tasks[i].final_len, final_hr,
+                        ahorro, tasks[i].elapsed_ms);
+            }
+
+            total_orig += tasks[i].orig_len;
+            total_final += tasks[i].final_len;
+            total_ms += tasks[i].elapsed_ms;
+        }
+        printf("--------------------------------------------------------------------------------------------------------\n");
+        double total_ahorro = total_orig ? (1.0 - (double)total_final / (double)total_orig) * 100.0 : 0.0;
+        char torig_hr[32] = {0}, tfinal_hr[32] = {0};
+        human_readable(total_orig, torig_hr, sizeof(torig_hr));
+        human_readable(total_final, tfinal_hr, sizeof(tfinal_hr));
+        printf("TOTAL                                      | %12zu (%6s) | %13zu (%6s) | %7.2f%% | %10.3f\n\n",
+               total_orig, torig_hr, total_final, tfinal_hr, total_ahorro, total_ms);
+
+        if (csv) {
+            csv_quote(csv, "TOTAL"); fprintf(csv, ",");
+            fprintf(csv, "%zu,%s,%zu,%s,%.2f,%.3f\n",
+                    total_orig, torig_hr, total_final, tfinal_hr, total_ahorro, total_ms);
+            fclose(csv);
+            printf("(Tabla exportada a %s)\n\n", csv_path);
         }
 
         free(tids);
@@ -770,91 +889,76 @@ static const char* choose_enc_alg_str(void) {
 }
 
 static int run_interactive(void) {
-    puts("=== GSEA - modo interactivo ===");
-    char* in = prompt_line("Ruta de entrada (-i): ");
-    if (!in) { puts("Entrada inválida."); return 1; }
-    char* out = prompt_line("Ruta de salida (-o): ");
-    if (!out) { free(in); puts("Salida inválida."); return 1; }
+    printf("Modo interactivo\n");
 
-    int do_c = prompt_yesno("¿Comprimir? (y/N): ");
-    int do_d = 0;
-    int do_e = prompt_yesno("¿Encriptar? (y/N): ");
-    int do_u = 0;
-    if (!do_c && !do_e) {
-        puts("Ninguna operación seleccionada. Puedes combinar compresión (-c) y/o encriptado (-e).");
+    char* in_path = prompt_line("Ruta de entrada: ");
+    if (!in_path) return 1;
+
+    char* out_path = prompt_line("Ruta de salida: ");
+    if (!out_path) { free(in_path); return 1; }
+
+    printf("Operación:\n");
+    printf("  1. Comprimir\n");
+    printf("  2. Encriptar\n");
+    printf("  3. Comprimir y Encriptar\n");
+    printf("  4. Descomprimir\n");
+    printf("  5. Desencriptar\n");
+    printf("  6. Descomprimir y Desencriptar\n");
+    char* op_str = prompt_line("Opción [1-6]: ");
+    if (!op_str) { free(in_path); free(out_path); return 1; }
+    int op = atoi(op_str);
+    free(op_str);
+
+    const char* comp_alg_str = NULL;
+    if (op == 1 || op == 3 || op == 4 || op == 6) {
+        comp_alg_str = choose_comp_alg_str();
     }
 
-    const char* comp_alg = choose_comp_alg_str();
-    const char* enc_alg = choose_enc_alg_str();
-
+    const char* enc_alg_str = NULL;
     char* key = NULL;
-    if (strcmp(enc_alg, "vigenere") == 0 && do_e) {
-        key = prompt_line("Clave (para Vigenere) (-k): ");
-        if (!key) { puts("Clave vacía, abortando."); free(in); free(out); return 1; }
-    } else if (strcmp(enc_alg, "vigenere") == 0 && !do_e) {
-        /* si no se encripta pero usuario eligió algoritmo, no pedimos clave */
-    }
-
-    /* Construir comando seguro (escapamos comillas simples) */
-    char cmd[8192];
-    snprintf(cmd, sizeof(cmd), "./gsea");
-    if (do_c) strncat(cmd, " -c", sizeof(cmd)-strlen(cmd)-1);
-    if (do_d) strncat(cmd, " -d", sizeof(cmd)-strlen(cmd)-1);
-    if (do_e) strncat(cmd, " -e", sizeof(cmd)-strlen(cmd)-1);
-    if (do_u) strncat(cmd, " -u", sizeof(cmd)-strlen(cmd)-1);
-
-    char tmp[4096];
-    snprintf(tmp, sizeof(tmp), " --comp-alg %s", comp_alg);
-    strncat(cmd, tmp, sizeof(cmd)-strlen(cmd)-1);
-    snprintf(tmp, sizeof(tmp), " --enc-alg %s", enc_alg);
-    strncat(cmd, tmp, sizeof(cmd)-strlen(cmd)-1);
-
-    /* Añadir -i y -o (entre comillas simples, con escape de ' ) */
-    char in_esc[4096]={0}, out_esc[4096]={0};
-    size_t p=0;
-    in_esc[p++] = '\'';
-    for (size_t i=0;i<strlen(in) && p+2<sizeof(in_esc);++i) {
-        if (in[i]=='\'') { in_esc[p++]='\\'; in_esc[p++]='\''; } else in_esc[p++]=in[i];
-    }
-    in_esc[p++] = '\'';
-    in_esc[p]=0;
-    p=0;
-    out_esc[p++] = '\'';
-    for (size_t i=0;i<strlen(out) && p+2<sizeof(out_esc);++i) {
-        if (out[i]=='\'') { out_esc[p++]='\\'; out_esc[p++]='\''; } else out_esc[p++]=out[i];
-    }
-    out_esc[p++] = '\'';
-    out_esc[p]=0;
-
-    strncat(cmd, " -i ", sizeof(cmd)-strlen(cmd)-1);
-    strncat(cmd, in_esc, sizeof(cmd)-strlen(cmd)-1);
-    strncat(cmd, " -o ", sizeof(cmd)-strlen(cmd)-1);
-    strncat(cmd, out_esc, sizeof(cmd)-strlen(cmd)-1);
-
-    if (key && do_e) {
-        /* escapamos la clave de forma simple */
-        char kesc[1024] = {'\0'};
-        size_t kk=0; kesc[kk++] = '\'';
-        for (size_t i=0;i<strlen(key) && kk+2<sizeof(kesc);++i) {
-            if (key[i]=='\'') { kesc[kk++]='\\'; kesc[kk++]='\''; } else kesc[kk++]=key[i];
+    if (op == 2 || op == 3 || op == 5 || op == 6) {
+        enc_alg_str = choose_enc_alg_str();
+        if (strcmp(enc_alg_str, "none") != 0) {
+            key = prompt_line("Clave de Vigenère: ");
+            if (!key) { free(in_path); free(out_path); return 1; }
         }
-        kesc[kk++] = '\''; kesc[kk]=0;
-        strncat(cmd, " -k ", sizeof(cmd)-strlen(cmd)-1);
-        strncat(cmd, kesc, sizeof(cmd)-strlen(cmd)-1);
     }
 
-    printf("Comando a ejecutar:\n%s\n", cmd);
-    if (!prompt_yesno("Confirmar y ejecutar? (y/N): ")) {
-        puts("Cancelado.");
-        free(in); free(out); if (key) free(key);
-        return 0;
+    char cmd[2048] = {0};
+    strcat(cmd, "./gsea");
+    if (op == 1 || op == 3) strcat(cmd, " -c");
+    if (op == 2 || op == 3) strcat(cmd, " -e");
+    if (op == 4 || op == 6) strcat(cmd, " -d");
+    if (op == 5 || op == 6) strcat(cmd, " -u");
+
+    if (comp_alg_str) {
+        strcat(cmd, " --comp-alg ");
+        strcat(cmd, comp_alg_str);
+    }
+    if (enc_alg_str) {
+        strcat(cmd, " --enc-alg ");
+        strcat(cmd, enc_alg_str);
     }
 
-    /* Ejecuta el mismo binario con las opciones seleccionadas */
+    if (key) {
+        strcat(cmd, " -k \"");
+        strcat(cmd, key);
+        strcat(cmd, "\"");
+        free(key);
+    }
+
+    strcat(cmd, " -i \"");
+    strcat(cmd, in_path);
+    strcat(cmd, "\" -o \"");
+    strcat(cmd, out_path);
+    strcat(cmd, "\"");
+
+    free(in_path);
+    free(out_path);
+
+    printf("Ejecutando: %s\n", cmd);
     int rc = system(cmd);
-    printf("Proceso finalizó con código %d\n", rc);
-
-    free(in); free(out); if (key) free(key);
     return rc == -1 ? 1 : WEXITSTATUS(rc);
 }
-/* --------- fin menú interactivo --------- */
+
+/* ---------- Procesamiento de archivos ---------- */
