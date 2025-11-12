@@ -1,12 +1,45 @@
-# Compilados y binarios
-*.o
+# --- Archivos binarios compilados ---
 gsea
-# Archivos temporales
-*.swp
-*.tmp
-# Salidas
-out/
+*.o
+*.out
+*.exe
 
-#Archivos pesados que no soporta github
-tests/archivo.txt
-tests/noticia.txt
+# --- Directorios de pruebas grandes ---
+tests/
+tests/*
+
+# --- Archivos comprimidos o temporales ---
+*.zip
+*.tar
+*.gz
+*.7z
+
+# --- Archivos de respaldo o caché ---
+*~
+*.swp
+*.bak
+*.tmp
+*.log
+
+# --- Archivos del sistema ---
+.DS_Store
+Thumbs.db
+
+# --- Archivos del entorno de desarrollo ---
+.vscode/
+.idea/
+
+# --- Archivos generados por sanitizers o depuración ---
+asan.*
+lsan.*
+msan.*
+tsan.*
+ubsan.*
+
+# --- Archivos multimedia pesados opcionales ---
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.wav
+*.mp3
