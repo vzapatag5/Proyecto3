@@ -3,8 +3,12 @@
  *      Includes, defines, enums, structs y prototipos
  *************************************************************/
 
+#ifndef _DEFAULT_SOURCE
 #define _DEFAULT_SOURCE
-#define _POSIX_C_SOURCE 199309L
+#endif
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -74,14 +78,21 @@ typedef struct {
     int workers;
     int inner_workers;
     int verbose;
+
+    /* Nuevo: flag de journaling (usado por JPRINT) */
+    int journaling;
 } Config;
+
+/* Macro de journaling disponible temprano (usada en comp/decomp) */
+#ifndef JPRINT
+#define JPRINT(...) do { if ((cfg)->journaling) { fprintf(stderr, __VA_ARGS__); } } while (0)
+#endif
 
 /* ---------- Prototipos globales ---------- */
 static int   ensure_tests_dir(void);
 static char* build_tests_output_path(const char* out_path);
 static char* join2(const char* a, const char* b);
 static int   run_interactive(void);
-static char* prompt_line(const char* prompt);
 static void  human_readable(size_t bytes, char* out, size_t out_size);
 static void  csv_quote(FILE* f, const char* s);
 
@@ -102,40 +113,15 @@ static uint32_t rd32le(const uint8_t* p);
 /* Pipeline principal */
 static int process_one_file(const char* in, const char* out, const Config* cfg,
                             size_t* o_orig, size_t* o_fin, double* o_ms);
-
-/* Chunked compression */
-static int chunked_compress_rle_lzw(const uint8_t* in, size_t len,
-                                    const Config* cfg,
-                                    uint8_t** out, size_t* out_len);
-
-/* Chunked decompression */
-static int chunked_decompress_rle_lzw(const uint8_t* in, size_t len,
-                                      const Config* cfg,
-                                      uint8_t** out, size_t* out_len);
+static int compress_chunked(const Config* cfg,
+                            const uint8_t* in, size_t in_len,
+                            uint8_t** out, size_t* out_len);
+static int decompress_chunked(const Config* cfg,
+                              const uint8_t* in, size_t in_len,
+                              uint8_t** out, size_t* out_len);
 
 /* ----- Thread job para archivo ----- */
-typedef struct {
-    char* in;
-    char* out;
-    const Config* cfg;
-    int res;
-    size_t orig, fin;
-    double ms;
-} Task;
-
-/* Ejecuta un archivo dentro del pool externo */
-static void task_run(void* arg);
-
-/* ---------- Estructuras para listar archivos del directorio ---------- */
-typedef struct {
-    char** in;
-    char** out;
-    size_t n, cap;
-} PathList;
-
-static void pl_init(PathList* p);
-static void pl_free(PathList* p);
-static int  pl_push(PathList* p, char* in, char* out);
+/* (Definición única más abajo en "Estructura de Tarea") */
 
 /*************************************************************
  *                     FIN PARTE 1
@@ -300,43 +286,8 @@ static uint32_t rd32le(const uint8_t* p) {
          | ((uint32_t)p[3] << 24);
 }
 
-/* ---------- Lista de paths ---------- */
-static void pl_init(PathList* p) {
-    p->in = p->out = NULL;
-    p->n = p->cap = 0;
-}
-
-static void pl_free(PathList* p) {
-    for (size_t i=0; i<p->n; i++) {
-        free(p->in[i]);
-        free(p->out[i]);
-    }
-    free(p->in);
-    free(p->out);
-}
-
-static int pl_push(PathList* p, char* in, char* out) {
-    if (p->n == p->cap) {
-        size_t newcap = p->cap ? p->cap*2 : 64;
-        char** ni = realloc(p->in,  newcap*sizeof(char*));
-        char** no = realloc(p->out, newcap*sizeof(char*));
-        if (!ni || !no) return -1;
-        p->in  = ni;
-        p->out = no;
-        p->cap = newcap;
-    }
-    p->in[p->n]  = in;
-    p->out[p->n] = out;
-    p->n++;
-    return 0;
-}
-
 /* ---------- Ejecutar una tarea (archivo) ---------- */
-static void task_run(void* arg) {
-    Task* t = (Task*)arg;
-    t->res = process_one_file(t->in, t->out, t->cfg,
-                              &t->orig, &t->fin, &t->ms);
-}
+/* (Implementación única más abajo en "Estructura de Tarea") */
 
 /*************************************************************
  *                     FIN PARTE 2
@@ -740,8 +691,10 @@ SAVE:
  *                     FIN PARTE 3
  *************************************************************/
 /* ---------- Macro simple de journaling ---------- */
+#ifndef JPRINT
 #define JPRINT(...) \
     do { if (cfg->journaling) { fprintf(stderr, __VA_ARGS__); } } while (0)
+#endif
 
 /*************************************************************
  *              LISTA DE OPCIONES PARA GETOPT
@@ -753,7 +706,7 @@ static int parse_args(int argc, char* argv[], Config* cfg)
 
     cfg->comp_alg = COMP_RLEVAR;
     cfg->enc_alg  = ENC_VIG;
-    cfg->journaling = 0;
+    cfg->journaling = 0; // ok: ahora existe el campo
 
     static struct option long_opts[] = {
         {"comp-alg",  required_argument, 0, 1},
@@ -996,6 +949,14 @@ static int run_interactive() {
             strcat(cmd, key);
             strcat(cmd, " ");
         }
+    }
+
+    /* nuevo: preguntar por journaling */
+    printf("¿Activar journaling (paso a paso)? [s/N]: ");
+    char jopt = 'n';
+    scanf(" %c", &jopt);
+    if (jopt == 's' || jopt == 'S') {
+        strcat(cmd, "-j ");
     }
 
     strcat(cmd, "-i ");

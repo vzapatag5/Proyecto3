@@ -1,6 +1,29 @@
+/*
+ * AES simple: usa OpenSSL si está disponible. Si no, compila stubs que
+ * reportan error (-1) para mantener el proyecto compilable sin libssl-dev.
+ */
 #include "aes_simple.h"
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef NO_OPENSSL
+
+int aes_encrypt_buffer(const uint8_t* in, size_t in_len,
+                       const char* pass,
+                       uint8_t** out, size_t* out_len) {
+    (void)in; (void)in_len; (void)pass; (void)out; (void)out_len;
+    return -1; /* AES no disponible (sin OpenSSL) */
+}
+
+int aes_decrypt_buffer(const uint8_t* in, size_t in_len,
+                       const char* pass,
+                       uint8_t** out, size_t* out_len) {
+    (void)in; (void)in_len; (void)pass; (void)out; (void)out_len;
+    return -1; /* AES no disponible (sin OpenSSL) */
+}
+
+#else
+
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 
@@ -93,3 +116,5 @@ cleanup:
     OPENSSL_cleanse(iv, sizeof(iv));
     return rc;
 }
+
+#endif /* NO_OPENSSL */

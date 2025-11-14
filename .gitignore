@@ -43,3 +43,6 @@ ubsan.*
 *.bmp
 *.wav
 *.mp3
+
+tests/archivo.txt
+tests/noticia.txt
