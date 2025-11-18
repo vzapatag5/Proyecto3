@@ -39,14 +39,6 @@
 #define WAV_MAGIC       "GSEAWAV1"
 #define WAV_MAGIC_LEN   8
 
-#define CHNK_MAGIC      "GSEACHNK"
-#define CHNK_MAGIC_LEN  8
-
-#define MAGIC_HDR       "GSEAIMG1"
-#define MAGIC_HDR_LEN   8
-#define FMT_PNG         1
-#define FMT_JPEG        2
-
 /* Tamaño de chunk 16 MB */
 #define CHUNK_SIZE (16 * 1024 * 1024)
 
@@ -75,11 +67,9 @@ typedef struct {
     CompAlg comp_alg;
     EncAlg  enc_alg;
 
-    int workers;
-    int inner_workers;
-    int verbose;
-
-    /* Nuevo: flag de journaling (usado por JPRINT) */
+    int workers;        // ← MANTENER (pool externo futuro)
+    int inner_workers;  // ← MANTENER (paralelización chunks)
+    int verbose;        // ← MANTENER (logs detallados)
     int journaling;
 } Config;
 
@@ -89,12 +79,8 @@ typedef struct {
 #endif
 
 /* ---------- Prototipos globales ---------- */
-static int   ensure_tests_dir(void);
-static char* build_tests_output_path(const char* out_path);
-static char* join2(const char* a, const char* b);
 static int   run_interactive(void);
 static void  human_readable(size_t bytes, char* out, size_t out_size);
-static void  csv_quote(FILE* f, const char* s);
 
 /* Predictor SUB */
 static void apply_predictor_sub(uint8_t* buf, int w, int h, int ch);
@@ -243,25 +229,6 @@ static char* build_tests_output_path(const char* out_path) {
     return final;
 }
 
-static void human_readable(size_t bytes, char* out, size_t out_size) {
-    const char* u[] = {"B","KB","MB","GB","TB"};
-    double v = bytes;
-    int i = 0;
-    while(v>=1024 && i<4){v/=1024;i++;}
-    snprintf(out, out_size, "%.2f%s", v, u[i]);
-}
-
-static void csv_quote(FILE* f, const char* s) {
-    fputc('"', f);
-    if (s) {
-        for (const char* p = s; *p; p++) {
-            if (*p=='"') fputc('"', f);
-            fputc(*p, f);
-        }
-    }
-    fputc('"', f);
-}
-
 /* ---------- Helpers LE ---------- */
 static void wr16le(uint8_t* p, uint16_t v) {
     p[0] = v & 0xFF;
@@ -286,6 +253,18 @@ static uint32_t rd32le(const uint8_t* p) {
          | ((uint32_t)p[3] << 24);
 }
 
+/* ---------- Formato legible de tamaño ---------- */
+static void human_readable(size_t bytes, char* out, size_t out_size) {
+    const char* u[] = {"B","KB","MB","GB","TB"};
+    double v = (double)bytes;
+    int i = 0;
+    while (v >= 1024 && i < 4) {
+        v /= 1024;
+        i++;
+    }
+    snprintf(out, out_size, "%.2f%s", v, u[i]);
+}
+
 /* ---------- Ejecutar una tarea (archivo) ---------- */
 /* (Implementación única más abajo en "Estructura de Tarea") */
 
@@ -304,15 +283,19 @@ static int compress_chunked(const Config* cfg,
 {
     const size_t CH = 16*1024*1024;
     size_t pos = 0;
-
-    *out = NULL;
+    
+    /* Pre-alocar estimado (evita reallocs constantes) */
+    size_t cap = in_len; /* peor caso: expansión */
+    *out = malloc(cap);
     *out_len = 0;
 
     while (pos < in_len) {
         size_t csize = in_len - pos;
         if (csize > CH) csize = CH;
 
-        JPRINT("[JOURNAL] → Chunk nuevo (%zu bytes)\n", csize);
+        JPRINT("[JOURNAL] → Chunk %zu/%zu (%.1f%%)\n", 
+               pos/CH + 1, (in_len + CH - 1)/CH, 
+               100.0 * pos / in_len);
 
         uint8_t* bout = NULL;
         size_t blen = 0;
@@ -365,21 +348,23 @@ static int compress_chunked(const Config* cfg,
             return -1;
         }
 
-        uint8_t* merged = realloc(*out, *out_len + blen);
-        if (!merged) {
-            fprintf(stderr, "Fallo realloc\n");
-            free(bout);
-            free(*out);
-            return -1;
+        /* Asegurar espacio antes de copiar */
+        if (*out_len + blen > cap) {
+            cap = cap * 2 + blen;
+            uint8_t* tmp = realloc(*out, cap);
+            if (!tmp) { free(bout); free(*out); return -1; }
+            *out = tmp;
         }
-        *out = merged;
+        
         memcpy((*out) + (*out_len), bout, blen);
         *out_len += blen;
-
         free(bout);
         pos += csize;
     }
-
+    
+    /* Shrink final */
+    uint8_t* final = realloc(*out, *out_len);
+    if (final) *out = final;
     return 0;
 }
 
@@ -766,6 +751,13 @@ static int parse_args(int argc, char* argv[], Config* cfg)
         }
     }
 
+#ifdef NO_OPENSSL
+    if (cfg->enc_alg == ENC_AES) {
+        fprintf(stderr, "AES no disponible: instale libssl-dev y recompile.\n");
+        return -1;
+    }
+#endif
+
     /* Validación mínima */
     if (!cfg->in_path || !cfg->out_path) {
         fprintf(stderr, "Debe indicar ruta de entrada -i y ruta de salida -o.\n");
@@ -890,15 +882,23 @@ static const char* choose_comp_alg() {
 }
 
 static const char* choose_enc_alg() {
+#ifdef NO_OPENSSL
+    printf("Algoritmo de cifrado:\n");
+    printf(" 1) vigenere\n");
+    printf(" 2) none\n");
+    printf(" (AES no disponible: compile con libssl-dev)\n> ");
+    int v; scanf("%d", &v);
+    return (v == 2) ? "none" : "vigenere";
+#else
     printf("Algoritmo de cifrado:\n");
     printf(" 1) vigenere\n");
     printf(" 2) aes\n");
     printf(" 3) none\n> ");
-    int v;
-    scanf("%d", &v);
+    int v; scanf("%d", &v);
     if (v == 2) return "aes";
     if (v == 3) return "none";
     return "vigenere";
+#endif
 }
 
 static int run_interactive() {
@@ -1002,9 +1002,9 @@ int main(int argc, char* argv[])
 
         double ahorro = (t.orig ? (1.0 - (double)t.fin / t.orig) * 100.0 : 0.0);
 
-        printf("\nArchivo | Orig | Final | Ahorro(%%) | Tiempo(ms)\n");
-        printf("-------------------------------------------------\n");
-        printf("%s  %zu (%s) → %zu (%s)  %.2f%%   %.3f ms\n",
+        printf("\nArchivo            | Orig          | Final         | Ahorro(%%) | Tiempo(ms)\n");
+        printf("------------------------------------------------------------------------------\n");
+        printf("%s | %zu (%s)| → %zu (%s) | %.2f%%  | %.3f ms\n",
                cfg.in_path, t.orig, oh, t.fin, fh, ahorro, t.ms);
 
         return 0;
@@ -1054,12 +1054,8 @@ int main(int argc, char* argv[])
     tp_destroy(tp);
 
     /* Resultados */
-    printf("\nArchivo | Orig | Final | Ahorro(%%) | Tiempo(ms)\n");
-    printf("-----------------------------------------------------\n");
-
-    FILE* fcsv = fopen("gsea_results.csv", "w");
-    if (fcsv)
-        fprintf(fcsv, "archivo,orig,final,ahorro,t_ms\n");
+    printf("\nArchivo    | Orig          | Final         | Ahorro(%%) | Tiempo(ms)\n");
+    printf("----------------------------------------------------------------------\n");
 
     size_t total_o = 0, total_f = 0;
     double total_t = 0;
@@ -1073,18 +1069,13 @@ int main(int argc, char* argv[])
 
         double ahorro = (t->orig ? (1.0 - (double)t->fin / t->orig) * 100.0 : 0.0);
 
-        printf("%s  %zu (%s) → %zu (%s)  %.2f%%   %.3f ms\n",
+        printf("%s | %zu (%s)| → %zu (%s) | %.2f%%  | %.3f ms\n",
                t->in, t->orig, oh, t->fin, fh, ahorro, t->ms);
-
-        if (fcsv)
-            fprintf(fcsv, "%s,%zu,%zu,%.2f,%.3f\n",
-                    t->in, t->orig, t->fin, ahorro, t->ms);
 
         total_o += t->orig;
         total_f += t->fin;
         total_t += t->ms;
     }
-    if (fcsv) fclose(fcsv);
 
     printf("-----------------------------------------------------\n");
     printf("TOTAL: %zu → %zu  (%.2f%% ahorro)  Tiempo total: %.3f ms\n",
