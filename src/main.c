@@ -34,6 +34,7 @@
 #include "aes_simple.h"
 #include "audio_wav.h"
 #include "thread_pool.h"
+#include "journal.h"  // ← NUEVO
 
 /* ------------ MAGIC HEADERS PARA FORMATOS ------------- */
 #define WAV_MAGIC       "GSEAWAV1"
@@ -67,16 +68,12 @@ typedef struct {
     CompAlg comp_alg;
     EncAlg  enc_alg;
 
-    int workers;        // ← MANTENER (pool externo futuro)
-    int inner_workers;  // ← MANTENER (paralelización chunks)
-    int verbose;        // ← MANTENER (logs detallados)
-    int journaling;
+    int workers;
+    int inner_workers;
+    int verbose;
+    
+    Journal journal;  // ← CAMBIO: en vez de int journaling
 } Config;
-
-/* Macro de journaling disponible temprano (usada en comp/decomp) */
-#ifndef JPRINT
-#define JPRINT(...) do { if ((cfg)->journaling) { fprintf(stderr, __VA_ARGS__); } } while (0)
-#endif
 
 /* ---------- Prototipos globales ---------- */
 static int   run_interactive(void);
@@ -293,7 +290,7 @@ static int compress_chunked(const Config* cfg,
         size_t csize = in_len - pos;
         if (csize > CH) csize = CH;
 
-        JPRINT("[JOURNAL] → Chunk %zu/%zu (%.1f%%)\n", 
+        JLOG(&cfg->journal, "[JOURNAL] → Chunk %zu/%zu (%.1f%%)\n", 
                pos/CH + 1, (in_len + CH - 1)/CH, 
                100.0 * pos / in_len);
 
@@ -306,17 +303,17 @@ static int compress_chunked(const Config* cfg,
         switch(cfg->comp_alg)
         {
             case COMP_RLEVAR:
-                JPRINT("[JOURNAL]   RLE-Var\n");
-                rle_var_compress(p, csize, &bout, &blen);
+                JLOG(&cfg->journal, "[JOURNAL]   RLE-Var\n");
+                rc = rle_var_compress(p, csize, &bout, &blen);
                 break;
 
             case COMP_LZW:
-                JPRINT("[JOURNAL]   LZW\n");
+                JLOG(&cfg->journal, "[JOURNAL]   LZW\n");
                 rc = lzw_compress(p, csize, &bout, &blen);
                 break;
 
             case COMP_LZWPRED: {
-                JPRINT("[JOURNAL]   Predictor SUB + LZW\n");
+                JLOG(&cfg->journal, "[JOURNAL]   Predictor SUB + LZW\n");
                 uint8_t* tmp = malloc(csize);
                 memcpy(tmp, p, csize);
                 apply_predictor_sub(tmp, 1, 1, 1);
@@ -326,13 +323,11 @@ static int compress_chunked(const Config* cfg,
             }
 
             case COMP_HUFFMANPRED: {
-                JPRINT("[JOURNAL]   Predictor SUB + Huffman\n");
+                JLOG(&cfg->journal, "[JOURNAL]   Predictor SUB + Huffman\n");
                 uint8_t* tmp = malloc(csize);
                 memcpy(tmp, p, csize);
                 apply_predictor_sub(tmp, 1, 1, 1);
-
                 rc = hp_compress_buffer(tmp, csize, &bout, &blen);
-
                 free(tmp);
                 break;
             }
@@ -383,7 +378,7 @@ static int decompress_chunked(const Config* cfg,
         size_t csize = in_len - pos;
         if (csize > CH) csize = CH;
 
-        JPRINT("[JOURNAL] → Chunk dec (%zu bytes)\n", csize);
+        JLOG(&cfg->journal, "[JOURNAL] → Chunk dec (%zu bytes)\n", csize);
 
         const uint8_t* p = in + pos;
 
@@ -444,7 +439,7 @@ static int process_one_file(const char* in, const char* out,
                             const Config* cfg,
                             size_t* o_orig, size_t* o_fin, double* o_ms)
 {
-    JPRINT("\n[JOURNAL] Leyendo archivo: %s\n", in);
+    JLOG(&cfg->journal, "\n[JOURNAL] Leyendo archivo: %s\n", in);
 
     uint8_t* buf = NULL;
     size_t len = 0;
@@ -462,7 +457,6 @@ static int process_one_file(const char* in, const char* out,
     uint8_t* tmp = NULL;
     size_t tlen = 0;
 
-    /* Detectar WAV PCM16 para delta16 */
     int is_wav_pcm16 = 0;
     int wav_ch = 0, wav_sr = 0;
     size_t wav_frames = 0;
@@ -481,7 +475,7 @@ static int process_one_file(const char* in, const char* out,
                 len = wav_frames * wav_ch * 2;
                 is_wav_pcm16 = 1;
 
-                JPRINT("[JOURNAL] WAV detectado (%d ch, %d SR)\n",
+                JLOG(&cfg->journal, "[JOURNAL] WAV detectado (%d ch, %d SR)\n",
                        wav_ch, wav_sr);
             }
         }
@@ -489,7 +483,7 @@ static int process_one_file(const char* in, const char* out,
 
     /* ========== COMPRESIÓN ========== */
     if (cfg->do_c) {
-        JPRINT("[JOURNAL] Iniciando compresión...\n");
+        JLOG(&cfg->journal, "[JOURNAL] Iniciando compresión...\n");
 
         if (cfg->comp_alg == COMP_DELTA16_LZW ||
             cfg->comp_alg == COMP_DELTA16_HUFF)
@@ -541,14 +535,14 @@ static int process_one_file(const char* in, const char* out,
         tmp = NULL;
         tlen = 0;
 
-        JPRINT("[JOURNAL] Compresión lista: %zu bytes\n", len);
+        JLOG(&cfg->journal, "[JOURNAL] Compresión lista: %zu bytes\n", len);
     }
 
 ENCRYPT:
 
     /* ========== CIFRADO ========== */
     if (cfg->do_e) {
-        JPRINT("[JOURNAL] Cifrando...\n");
+        JLOG(&cfg->journal, "[JOURNAL] Cifrando...\n");
 
         if (cfg->enc_alg == ENC_VIG) {
             vigenere_encrypt(buf, len, (uint8_t*)cfg->key, strlen(cfg->key));
@@ -569,7 +563,7 @@ ENCRYPT:
 
     /* ========== DESCIFRADO ========== */
     if (cfg->do_u) {
-        JPRINT("[JOURNAL] Descifrando...\n");
+        JLOG(&cfg->journal, "[JOURNAL] Descifrando...\n");
         if (cfg->enc_alg == ENC_VIG) {
             vigenere_decrypt(buf, len,
                              (uint8_t*)cfg->key, strlen(cfg->key));
@@ -589,7 +583,7 @@ ENCRYPT:
 
     /* ========== DESCOMPRESIÓN ========== */
     if (cfg->do_d) {
-        JPRINT("[JOURNAL] Descomprimiendo...\n");
+        JLOG(&cfg->journal, "[JOURNAL] Descomprimiendo...\n");
 
         /* WAV delta16 */
         if (cfg->comp_alg == COMP_DELTA16_LZW ||
@@ -651,17 +645,15 @@ ENCRYPT:
         tmp = NULL;
         tlen = 0;
 
-        JPRINT("[JOURNAL] Descompresión lista (%zu bytes)\n", len);
+        JLOG(&cfg->journal, "[JOURNAL] Descompresión lista (%zu bytes)\n", len);
     }
 
 SAVE:
-    /* ========== GUARDAR ========== */
-    JPRINT("[JOURNAL] Guardando en %s\n", out);
+    JLOG(&cfg->journal, "[JOURNAL] Guardando en %s\n", out);
 
     int wres = write_file(out, buf, len);
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
-
     double ms = (t1.tv_sec-t0.tv_sec)*1000.0 +
                 (t1.tv_nsec-t0.tv_nsec)/1e6;
 
@@ -691,7 +683,8 @@ static int parse_args(int argc, char* argv[], Config* cfg)
 
     cfg->comp_alg = COMP_RLEVAR;
     cfg->enc_alg  = ENC_VIG;
-    cfg->journaling = 0; // ok: ahora existe el campo
+    
+    journal_init(&cfg->journal);  // ← NUEVO: inicializar journal
 
     static struct option long_opts[] = {
         {"comp-alg",  required_argument, 0, 1},
@@ -715,7 +708,9 @@ static int parse_args(int argc, char* argv[], Config* cfg)
             case 'o': cfg->out_path = optarg; break;
             case 'k': cfg->key      = optarg; break;
 
-            case 'j': cfg->journaling = 1; break;
+            case 'j':
+                journal_set_enabled(&cfg->journal, 1);  // ← CAMBIO
+                break;
 
             /* --- Opciones largas --- */
             case 1: /* --comp-alg */
@@ -742,7 +737,7 @@ static int parse_args(int argc, char* argv[], Config* cfg)
                 break;
 
             case 3:
-                cfg->journaling = 1;
+                journal_set_enabled(&cfg->journal, 1);  // ← CAMBIO
                 break;
 
             default:
@@ -1038,8 +1033,10 @@ int main(int argc, char* argv[])
     /* Crear carpeta de salida si no existe */
     mkdir(cfg.out_path, 0755);
 
-    /* Pool externo */
-    ThreadPool* tp = tp_create(4); /* 4 hilos por defecto */
+    /* Pool externo: 4 archivos simultáneos */
+    ThreadPool* tp = tp_create(4);
+
+    JLOG(&cfg.journal, "[JOURNAL] Pool externo: 4 hilos\n");
 
     Task* tasks = calloc(fl.count, sizeof(Task));
 

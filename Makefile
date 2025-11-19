@@ -14,7 +14,7 @@ CFLAGS += -DNO_OPENSSL
 LDLIBS_OPENSSL :=
 endif
 
-OBJ = src/main.o src/rle_var.o src/lzw.o src/image_png.o src/image_jpeg.o src/fs.o src/vigenere.o src/huffman_predictor.o src/aes_simple.o src/audio_wav.o src/thread_pool.o
+OBJ = src/main.o src/rle_var.o src/lzw.o src/image_png.o src/image_jpeg.o src/fs.o src/vigenere.o src/huffman_predictor.o src/aes_simple.o src/audio_wav.o src/thread_pool.o src/journal.o
 BIN=gsea
 
 $(BIN): $(OBJ)
