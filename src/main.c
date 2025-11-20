@@ -34,7 +34,7 @@
 #include "aes_simple.h"
 #include "audio_wav.h"
 #include "thread_pool.h"
-#include "journal.h"  // ← NUEVO
+#include "journal.h"  
 
 /* ------------ MAGIC HEADERS PARA FORMATOS ------------- */
 #define WAV_MAGIC       "GSEAWAV1"
@@ -42,6 +42,9 @@
 
 /* Tamaño de chunk 16 MB */
 #define CHUNK_SIZE (16 * 1024 * 1024)
+
+/* Tamaño de chunk por defecto: 100 MB */
+#define DEFAULT_CHUNK_MB 100
 
 /* ------------ ENUMS PARA OPCIONES ------------- */
 typedef enum {
@@ -71,8 +74,10 @@ typedef struct {
     int workers;
     int inner_workers;
     int verbose;
-    
-    Journal journal;  // ← CAMBIO: en vez de int journaling
+
+    size_t chunk_bytes;   // ← NUEVO: tamaño de chunk en bytes
+
+    Journal journal;
 } Config;
 
 /* ---------- Prototipos globales ---------- */
@@ -102,6 +107,12 @@ static int compress_chunked(const Config* cfg,
 static int decompress_chunked(const Config* cfg,
                               const uint8_t* in, size_t in_len,
                               uint8_t** out, size_t* out_len);
+
+// NUEVO: prototipos adelantados para evitar implícitas
+static int hw_threads(void);
+static int compress_chunked_parallel(const Config* cfg,
+                                     const uint8_t* in, size_t in_len,
+                                     uint8_t** out, size_t* out_len);
 
 /* ----- Thread job para archivo ----- */
 /* (Definición única más abajo en "Estructura de Tarea") */
@@ -176,55 +187,6 @@ static void delta16_inverse(int16_t* s, size_t frames, int ch) {
     }
 }
 
-/* ---------- Utilidades FS ---------- */
-static int ensure_tests_dir(void) {
-    struct stat st;
-    if (stat("tests", &st) == 0) {
-        if (S_ISDIR(st.st_mode)) return 0;
-        fprintf(stderr, "Existe archivo llamado 'tests' (no directorio)\n");
-        return -1;
-    }
-    if (mkdir("tests", 0755) == 0) return 0;
-    if (errno == EEXIST) return 0;
-    perror("mkdir tests");
-    return -1;
-}
-
-static char* join2(const char* a, const char* b) {
-    if (!a || !b) return NULL;
-    size_t na = strlen(a);
-    size_t nb = strlen(b);
-    int slash = (na>0 && a[na-1] != '/');
-
-    char* s = malloc(na + nb + (slash?2:1));
-    if (!s) return NULL;
-
-    strcpy(s, a);
-    if (slash) strcat(s, "/");
-    strcat(s, b);
-    return s;
-}
-
-static char* build_tests_output_path(const char* out_path) {
-    if (!out_path) return NULL;
-    size_t n = strlen(out_path);
-
-    char* copy = malloc(n+1);
-    if (!copy) return NULL;
-    memcpy(copy, out_path, n+1);
-
-    while (n>1 && copy[n-1]=='/') copy[--n] = '\0';
-
-    if (strncmp(copy, "tests/", 6)==0 || strcmp(copy, "tests")==0)
-        return copy;
-
-    const char* base = strrchr(copy, '/');
-    base = base ? base+1 : copy;
-
-    char* final = join2("tests", base);
-    free(copy);
-    return final;
-}
 
 /* ---------- Helpers LE ---------- */
 static void wr16le(uint8_t* p, uint16_t v) {
@@ -278,101 +240,87 @@ static int compress_chunked(const Config* cfg,
                             const uint8_t* in, size_t in_len,
                             uint8_t** out, size_t* out_len)
 {
-    const size_t CH = 16*1024*1024;
+    const size_t CH = cfg->chunk_bytes;
+
+    /* Ahora SIEMPRE paraleliza si hay más de 1 chunk (auto usa CPUs) */
+    if (in_len > CH) {
+        return compress_chunked_parallel(cfg, in, in_len, out, out_len);
+    }
+
     size_t pos = 0;
-    
-    /* Pre-alocar estimado (evita reallocs constantes) */
-    size_t cap = in_len; /* peor caso: expansión */
-    *out = malloc(cap);
+
+    // Prealocar: peor caso, expansión ≈ input
+    size_t cap = in_len ? in_len : 1;
+    *out = (uint8_t*)malloc(cap);
+    if (!*out) return -1;
     *out_len = 0;
 
     while (pos < in_len) {
         size_t csize = in_len - pos;
         if (csize > CH) csize = CH;
 
-        JLOG(&cfg->journal, "[JOURNAL] → Chunk %zu/%zu (%.1f%%)\n", 
-               pos/CH + 1, (in_len + CH - 1)/CH, 
-               100.0 * pos / in_len);
+        JLOG(&cfg->journal, "[JOURNAL] → Chunk %zu bytes\n", csize);
 
+        const uint8_t* p = in + pos;
         uint8_t* bout = NULL;
         size_t blen = 0;
-        const uint8_t* p = in + pos;
-
         int rc = 0;
 
-        switch(cfg->comp_alg)
-        {
+        switch (cfg->comp_alg) {
             case COMP_RLEVAR:
-                JLOG(&cfg->journal, "[JOURNAL]   RLE-Var\n");
-                rc = rle_var_compress(p, csize, &bout, &blen);
-                break;
-
+                rc = rle_var_compress(p, csize, &bout, &blen); break;
             case COMP_LZW:
-                JLOG(&cfg->journal, "[JOURNAL]   LZW\n");
-                rc = lzw_compress(p, csize, &bout, &blen);
-                break;
-
+                rc = lzw_compress(p, csize, &bout, &blen); break;
             case COMP_LZWPRED: {
-                JLOG(&cfg->journal, "[JOURNAL]   Predictor SUB + LZW\n");
                 uint8_t* tmp = malloc(csize);
+                if (!tmp) { free(*out); return -1; }
                 memcpy(tmp, p, csize);
                 apply_predictor_sub(tmp, 1, 1, 1);
                 rc = lzw_compress(tmp, csize, &bout, &blen);
                 free(tmp);
                 break;
             }
-
             case COMP_HUFFMANPRED: {
-                JLOG(&cfg->journal, "[JOURNAL]   Predictor SUB + Huffman\n");
                 uint8_t* tmp = malloc(csize);
+                if (!tmp) { free(*out); return -1; }
                 memcpy(tmp, p, csize);
                 apply_predictor_sub(tmp, 1, 1, 1);
                 rc = hp_compress_buffer(tmp, csize, &bout, &blen);
                 free(tmp);
                 break;
             }
-
             default:
-                fprintf(stderr, "compress_chunked: Algoritmo no válido.\n");
-                return -1;
+                fprintf(stderr, "Algoritmo no válido.\n");
+                free(*out); return -1;
         }
+        if (rc != 0) { fprintf(stderr, "Error al comprimir chunk\n"); free(*out); return -1; }
 
-        if (rc != 0) {
-            fprintf(stderr, "Error al comprimir chunk\n");
-            free(*out);
-            return -1;
-        }
-
-        /* Asegurar espacio antes de copiar */
         if (*out_len + blen > cap) {
-            cap = cap * 2 + blen;
-            uint8_t* tmp = realloc(*out, cap);
-            if (!tmp) { free(bout); free(*out); return -1; }
-            *out = tmp;
+            size_t ncap = cap * 2 + blen;
+            uint8_t* tmp2 = (uint8_t*)realloc(*out, ncap);
+            if (!tmp2) { free(bout); free(*out); return -1; }
+            *out = tmp2; cap = ncap;
         }
-        
-        memcpy((*out) + (*out_len), bout, blen);
+        memcpy(*out + *out_len, bout, blen);
         *out_len += blen;
         free(bout);
         pos += csize;
     }
-    
-    /* Shrink final */
-    uint8_t* final = realloc(*out, *out_len);
-    if (final) *out = final;
+
+    uint8_t* shrink = (uint8_t*)realloc(*out, *out_len ? *out_len : 1);
+    if (shrink) *out = shrink;
     return 0;
 }
 
-/* ---------- Descompresión chunked ---------- */
+/* ---------- Descompresión chunked (usa tamaño configurable) ---------- */
 static int decompress_chunked(const Config* cfg,
                               const uint8_t* in, size_t in_len,
                               uint8_t** out, size_t* out_len)
 {
-    const size_t CH = 16*1024*1024;
+    const size_t CH = cfg->chunk_bytes;
     size_t pos = 0;
 
-    *out = NULL;
-    *out_len = 0;
+    *out = NULL; *out_len = 0;
 
     while (pos < in_len) {
         size_t csize = in_len - pos;
@@ -381,50 +329,27 @@ static int decompress_chunked(const Config* cfg,
         JLOG(&cfg->journal, "[JOURNAL] → Chunk dec (%zu bytes)\n", csize);
 
         const uint8_t* p = in + pos;
-
         uint8_t* bout = NULL;
         size_t blen = 0;
         int rc = 0;
 
-        switch(cfg->comp_alg)
-        {
-            case COMP_RLEVAR:
-                rc = rle_var_decompress(p, csize, &bout, &blen);
-                break;
-
+        switch (cfg->comp_alg) {
+            case COMP_RLEVAR:   rc = rle_var_decompress(p, csize, &bout, &blen); break;
             case COMP_LZW:
-            case COMP_LZWPRED:
-                rc = lzw_decompress(p, csize, &bout, &blen);
-                break;
-
-            case COMP_HUFFMANPRED:
-                rc = hp_decompress_buffer(p, csize, &bout, &blen);
-                break;
-
-            default:
-                fprintf(stderr, "Algoritmo no válido.\n");
-                return -1;
+            case COMP_LZWPRED:  rc = lzw_decompress(p, csize, &bout, &blen); break;
+            case COMP_HUFFMANPRED: rc = hp_decompress_buffer(p, csize, &bout, &blen); break;
+            default: fprintf(stderr, "Algoritmo no válido.\n"); return -1;
         }
-
-        if (rc != 0) {
-            fprintf(stderr, "Falló descompresión chunk.\n");
-            free(*out);
-            return -1;
-        }
+        if (rc != 0) { fprintf(stderr, "Falló descompresión chunk.\n"); free(*out); return -1; }
 
         if (cfg->comp_alg == COMP_LZWPRED || cfg->comp_alg == COMP_HUFFMANPRED)
             undo_predictor_sub(bout, 1, 1, 1);
 
-        uint8_t* merged = realloc(*out, *out_len + blen);
-        if (!merged) {
-            free(bout);
-            free(*out);
-            return -1;
-        }
+        uint8_t* merged = (uint8_t*)realloc(*out, *out_len + blen ? *out_len + blen : 1);
+        if (!merged) { free(bout); free(*out); return -1; }
         *out = merged;
-        memcpy((*out) + (*out_len), bout, blen);
+        memcpy(*out + *out_len, bout, blen);
         *out_len += blen;
-
         free(bout);
         pos += csize;
     }
@@ -680,39 +605,38 @@ SAVE:
 static int parse_args(int argc, char* argv[], Config* cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
-
     cfg->comp_alg = COMP_RLEVAR;
     cfg->enc_alg  = ENC_VIG;
-    
-    journal_init(&cfg->journal);  // ← NUEVO: inicializar journal
+
+    /* 0 = auto (detecta CPUs). Antes era 4/1 fijos. */
+    cfg->workers = 0;
+    cfg->inner_workers = 0;
+    cfg->chunk_bytes = (size_t)DEFAULT_CHUNK_MB * 1024ull * 1024ull;
+
+    journal_init(&cfg->journal);
 
     static struct option long_opts[] = {
-        {"comp-alg",  required_argument, 0, 1},
-        {"enc-alg",   required_argument, 0, 2},
-        {"journal",   no_argument,       0, 3},
+        {"comp-alg",      required_argument, 0, 1},
+        {"enc-alg",       required_argument, 0, 2},
+        {"journal",       no_argument,       0, 3},
+        {"workers",       required_argument, 0, 4}, // ← NUEVO
+        {"inner-workers", required_argument, 0, 5}, // ← NUEVO
+        {"chunk-mb",      required_argument, 0, 6}, // ← NUEVO
         {0,0,0,0}
     };
 
     int opt, idx = 0;
-
-    while ((opt = getopt_long(argc, argv, "cdeui:o:k:j", long_opts, &idx)) != -1)
-    {
-        switch (opt)
-        {
+    while ((opt = getopt_long(argc, argv, "cdeui:o:k:j", long_opts, &idx)) != -1) {
+        switch (opt) {
             case 'c': cfg->do_c = 1; break;
             case 'd': cfg->do_d = 1; break;
             case 'e': cfg->do_e = 1; break;
             case 'u': cfg->do_u = 1; break;
-
             case 'i': cfg->in_path  = optarg; break;
             case 'o': cfg->out_path = optarg; break;
             case 'k': cfg->key      = optarg; break;
+            case 'j': journal_set_enabled(&cfg->journal, 1); break;
 
-            case 'j':
-                journal_set_enabled(&cfg->journal, 1);  // ← CAMBIO
-                break;
-
-            /* --- Opciones largas --- */
             case 1: /* --comp-alg */
                 if      (strcmp(optarg, "rlevar") == 0)        cfg->comp_alg = COMP_RLEVAR;
                 else if (strcmp(optarg, "lzw") == 0)           cfg->comp_alg = COMP_LZW;
@@ -736,8 +660,33 @@ static int parse_args(int argc, char* argv[], Config* cfg)
                 }
                 break;
 
-            case 3:
-                journal_set_enabled(&cfg->journal, 1);  // ← CAMBIO
+            case 3: journal_set_enabled(&cfg->journal, 1); break;
+
+            case 4: /* --workers */
+                if (strcmp(optarg, "auto")==0) cfg->workers = 0;
+                else {
+                    cfg->workers = atoi(optarg);
+                    if (cfg->workers < 0) cfg->workers = 0;
+                    if (cfg->workers > 64) cfg->workers = 64;
+                }
+                break;
+
+            case 5: /* --inner-workers */
+                if (strcmp(optarg, "auto")==0) cfg->inner_workers = 0;
+                else {
+                    cfg->inner_workers = atoi(optarg);
+                    if (cfg->inner_workers < 0) cfg->inner_workers = 0;
+                    if (cfg->inner_workers > 64) cfg->inner_workers = 64;
+                }
+                break;
+
+            case 6: /* --chunk-mb */
+                {
+                    long mb = atol(optarg);
+                    if (mb < 1) mb = 1;
+                    if (mb > 2048) mb = 2048; // 2GB por chunk máximo
+                    cfg->chunk_bytes = (size_t)mb * 1024ull * 1024ull;
+                }
                 break;
 
             default:
@@ -1033,20 +982,19 @@ int main(int argc, char* argv[])
     /* Crear carpeta de salida si no existe */
     mkdir(cfg.out_path, 0755);
 
-    /* Pool externo: 4 archivos simultáneos */
-    ThreadPool* tp = tp_create(4);
-
-    JLOG(&cfg.journal, "[JOURNAL] Pool externo: 4 hilos\n");
+    /* Pool externo con N trabajadores parametrizable */
+    size_t outer = (cfg.workers > 0) ? (size_t)cfg.workers : (size_t)hw_threads();
+    ThreadPool* tp = tp_create(outer);
+    JLOG(&cfg.journal, "[JOURNAL] Pool externo: %zu hilos, inner: %d, chunk: %zu MB\n",
+         outer, (cfg.inner_workers>0?cfg.inner_workers:hw_threads()), cfg.chunk_bytes/(1024*1024));
 
     Task* tasks = calloc(fl.count, sizeof(Task));
-
     for (size_t i = 0; i < fl.count; i++) {
         tasks[i].in  = fl.in[i];
         tasks[i].out = fl.out[i];
         tasks[i].cfg = &cfg;
         tp_submit(tp, task_run, &tasks[i]);
     }
-
     tp_wait(tp);
     tp_destroy(tp);
 
@@ -1083,5 +1031,103 @@ int main(int argc, char* argv[])
     fl_free(&fl);
     free(tasks);
 
+    return 0;
+}
+
+/* ---------- Helpers para cantidad de hilos ---------- */
+static int hw_threads(void) {
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (n <= 0) return 4;
+    if (n > 128) n = 128;
+    return (int)n;
+}
+
+/* ========== Paralelismo interno por chunks ========== */
+typedef struct {
+    const Config* cfg;
+    const uint8_t* in;
+    size_t len;
+    size_t chunk_id;
+    uint8_t* out;
+    size_t out_len;
+    int err;
+} ChunkTask;
+
+static void compress_chunk_worker(void* arg) {
+    ChunkTask* ct = (ChunkTask*)arg;
+    const uint8_t* p = ct->in; size_t n = ct->len;
+    uint8_t* bout = NULL; size_t blen = 0; int rc = 0;
+
+    switch (ct->cfg->comp_alg) {
+        case COMP_RLEVAR:   rc = rle_var_compress(p, n, &bout, &blen); break;
+        case COMP_LZW:      rc = lzw_compress(p, n, &bout, &blen); break;
+        case COMP_LZWPRED: {
+            uint8_t* tmp = malloc(n); if (!tmp){ ct->err=-1; return; }
+            memcpy(tmp, p, n); apply_predictor_sub(tmp, 1, 1, 1);
+            rc = lzw_compress(tmp, n, &bout, &blen); free(tmp); break;
+        }
+        case COMP_HUFFMANPRED: {
+            uint8_t* tmp = malloc(n); if (!tmp){ ct->err=-1; return; }
+            memcpy(tmp, p, n); apply_predictor_sub(tmp, 1, 1, 1);
+            rc = hp_compress_buffer(tmp, n, &bout, &blen); free(tmp); break;
+        }
+        default: rc = -1;
+    }
+    ct->err = rc; ct->out = bout; ct->out_len = blen;
+}
+
+static int compress_chunked_parallel(const Config* cfg,
+                                     const uint8_t* in, size_t in_len,
+                                     uint8_t** out, size_t* out_len)
+{
+    const size_t CH = cfg->chunk_bytes;
+    size_t n_chunks = (in_len + CH - 1) / CH;
+
+    int wanted = (cfg->inner_workers > 1) ? cfg->inner_workers : hw_threads();
+    if (wanted > (int)n_chunks) wanted = (int)n_chunks;
+    if (wanted < 1) wanted = 1;
+
+    JLOG(&cfg->journal, "[JOURNAL] Paralelo: %zu chunks con %d hilos\n", n_chunks, wanted);
+
+    ThreadPool* tp = tp_create((size_t)wanted);
+    if (!tp) return -1;
+
+    ChunkTask* tasks = (ChunkTask*)calloc(n_chunks, sizeof(ChunkTask));
+    if (!tasks) { tp_destroy(tp); return -1; }
+
+    for (size_t i = 0; i < n_chunks; i++) {
+        size_t off = i * CH;
+        size_t sz  = (off + CH > in_len) ? (in_len - off) : CH;
+        tasks[i].cfg = cfg;
+        tasks[i].in  = in + off;
+        tasks[i].len = sz;
+        tasks[i].chunk_id = i;
+        tp_submit(tp, compress_chunk_worker, &tasks[i]);
+    }
+
+    tp_wait(tp);
+    tp_destroy(tp);
+
+    size_t total = 0;
+    for (size_t i = 0; i < n_chunks; i++) {
+        if (tasks[i].err) {
+            for (size_t j = 0; j < n_chunks; j++) free(tasks[j].out);
+            free(tasks); return -1;
+        }
+        total += tasks[i].out_len;
+    }
+
+    uint8_t* buf = (uint8_t*)malloc(total ? total : 1);
+    if (!buf) { for (size_t j = 0; j < n_chunks; j++) free(tasks[j].out); free(tasks); return -1; }
+
+    size_t k = 0;
+    for (size_t i = 0; i < n_chunks; i++) {
+        memcpy(buf + k, tasks[i].out, tasks[i].out_len);
+        k += tasks[i].out_len;
+        free(tasks[i].out);
+    }
+    free(tasks);
+
+    *out = buf; *out_len = total;
     return 0;
 }
