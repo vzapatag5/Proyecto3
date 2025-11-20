@@ -1,8 +1,17 @@
-/*************************************************************
- *                     GSEA MAIN (PARTE 1)
- *      Includes, defines, enums, structs y prototipos
- *************************************************************/
 
+
+/* =============================================================
+ * GSEA - Compresión y Encriptación
+ * -------------------------------------------------------------
+ * Este archivo coordina el flujo:
+ *   1. Lee parámetros (-c -d -e -u, algoritmos, hilos, chunk).
+ *   2. Procesa un archivo o todos los de una carpeta.
+ *   3. Etapas opcionales: compresión / cifrado / descifrado / descompresión.
+ *   4. Soporte especial para WAV (delta16) y predictor SUB en algunos modos.
+ *   5. Paralelismo externo (archivos) e interno (chunks grandes).
+ *   6. Journaling (-j) para ver pasos en tiempo real.
+ * Objetivo: ofrecer un pipeline claro y modular para estudiar.
+ * ============================================================= */
 #ifndef _DEFAULT_SOURCE
 #define _DEFAULT_SOURCE
 #endif
@@ -36,17 +45,15 @@
 #include "thread_pool.h"
 #include "journal.h"  
 
-/* ------------ MAGIC HEADERS PARA FORMATOS ------------- */
+/* Constantes generales */
 #define WAV_MAGIC       "GSEAWAV1"
 #define WAV_MAGIC_LEN   8
 
-/* Tamaño de chunk 16 MB */
-#define CHUNK_SIZE (16 * 1024 * 1024)
 
-/* Tamaño de chunk por defecto: 100 MB */
+/* Tamaño por defecto de chunk para procesamiento en paralelo: 100 MB */
 #define DEFAULT_CHUNK_MB 100
 
-/* ------------ ENUMS PARA OPCIONES ------------- */
+/* Algoritmos de compresión disponibles */
 typedef enum {
     COMP_RLEVAR,
     COMP_LZW,
@@ -56,13 +63,20 @@ typedef enum {
     COMP_DELTA16_HUFF
 } CompAlg;
 
+/* Algoritmos de encriptación disponibles */
 typedef enum {
     ENC_NONE,
     ENC_VIG,
     ENC_AES
 } EncAlg;
 
-/* Configuración global */
+/* Config: opciones elegidas por el usuario. Campos clave:
+ * do_c/do_d/do_e/do_u = qué operaciones se activan.
+ * comp_alg / enc_alg  = algoritmos seleccionados.
+ * workers / inner_workers = hilos externos (archivos) e internos (chunks). 0=auto.
+ * chunk_bytes = tamaño de cada porción para dividir archivos grandes.
+ * journal = controla si se imprimen mensajes paso a paso.
+ */
 typedef struct {
     int do_c, do_d, do_e, do_u;
     const char* in_path;
@@ -75,58 +89,50 @@ typedef struct {
     int inner_workers;
     int verbose;
 
-    size_t chunk_bytes;   // ← NUEVO: tamaño de chunk en bytes
+    size_t chunk_bytes;   
 
     Journal journal;
 } Config;
 
-/* ---------- Prototipos globales ---------- */
+/* Prototipos principales del pipeline */
 static int   run_interactive(void);
 static void  human_readable(size_t bytes, char* out, size_t out_size);
 
-/* Predictor SUB */
+/* Predictor SUB: resta el pixel/byte anterior para generar diferencias */
 static void apply_predictor_sub(uint8_t* buf, int w, int h, int ch);
 static void undo_predictor_sub(uint8_t* buf, int w, int h, int ch);
 
-/* Delta 16 PCM */
-static void delta16_forward(int16_t* s, size_t frames, int ch);
-static void delta16_inverse(int16_t* s, size_t frames, int ch);
 
-/* Little endian helpers */
-static void wr16le(uint8_t* p, uint16_t v);
-static void wr32le(uint8_t* p, uint32_t v);
-static uint16_t rd16le(const uint8_t* p);
-static uint32_t rd32le(const uint8_t* p);
+static void delta16_forward(int16_t* s, size_t frames, int ch);  /* Aplica diferencia entre muestras PCM16 */
+static void delta16_inverse(int16_t* s, size_t frames, int ch);  /* Revierte la diferencia */
+
+
+static void wr16le(uint8_t* p, uint16_t v); /* Escribe 16 bits little-endian */
+static void wr32le(uint8_t* p, uint32_t v); /* Escribe 32 bits little-endian */
+static uint16_t rd16le(const uint8_t* p);  /* Lee 16 bits little-endian */
+static uint32_t rd32le(const uint8_t* p);  /* Lee 32 bits little-endian */
 
 /* Pipeline principal */
 static int process_one_file(const char* in, const char* out, const Config* cfg,
-                            size_t* o_orig, size_t* o_fin, double* o_ms);
+                            size_t* o_orig, size_t* o_fin, double* o_ms); /* Ejecuta todas las etapas sobre 1 archivo */
 static int compress_chunked(const Config* cfg,
                             const uint8_t* in, size_t in_len,
-                            uint8_t** out, size_t* out_len);
+                            uint8_t** out, size_t* out_len);        /* Divide y comprime por trozos */
 static int decompress_chunked(const Config* cfg,
                               const uint8_t* in, size_t in_len,
-                              uint8_t** out, size_t* out_len);
+                              uint8_t** out, size_t* out_len);      /* Reconstruye concatenando trozos */
 
-// NUEVO: prototipos adelantados para evitar implícitas
-static int hw_threads(void);
+
+static int hw_threads(void); /* Detecta núcleos disponibles */
 static int compress_chunked_parallel(const Config* cfg,
                                      const uint8_t* in, size_t in_len,
-                                     uint8_t** out, size_t* out_len);
+                                     uint8_t** out, size_t* out_len); /* Versión paralela interna */
 
-/* ----- Thread job para archivo ----- */
-/* (Definición única más abajo en "Estructura de Tarea") */
 
-/*************************************************************
- *                     FIN PARTE 1
- *************************************************************/
-/*************************************************************
- *                     GSEA MAIN (PARTE 2)
- *       Predictor SUB, Delta-16, FS utils, LE, listas
- *************************************************************/
 
-/* ---------- Predictor SUB (para LZW-PRED y HUFFMAN-PRED) ---------- */
+
 static void apply_predictor_sub(uint8_t* buf, int w, int h, int ch) {
+    /* Recorre la fila y reemplaza cada valor por (actual - anterior) */
     if (!buf) return;
     for (int y = 0; y < h; ++y) {
         size_t base = (size_t)y * w * ch;
@@ -144,6 +150,7 @@ static void apply_predictor_sub(uint8_t* buf, int w, int h, int ch) {
 }
 
 static void undo_predictor_sub(uint8_t* buf, int w, int h, int ch) {
+    /* Reconstruye sumando el valor previo */
     if (!buf) return;
     for (int y = 0; y < h; ++y) {
         size_t base = (size_t)y * w * ch;
@@ -160,8 +167,9 @@ static void undo_predictor_sub(uint8_t* buf, int w, int h, int ch) {
     }
 }
 
-/* ---------- Delta-16 PCM para WAV ---------- */
+
 static void delta16_forward(int16_t* s, size_t frames, int ch) {
+    /* Convierte muestras PCM16 a diferencias para mejorar compresión */
     for (int c = 0; c < ch; ++c) {
         int16_t prev = 0;
         for (size_t i = 0; i < frames; ++i) {
@@ -175,6 +183,7 @@ static void delta16_forward(int16_t* s, size_t frames, int ch) {
 }
 
 static void delta16_inverse(int16_t* s, size_t frames, int ch) {
+    /* Revierte las diferencias a muestras originales */
     for (int c = 0; c < ch; ++c) {
         int16_t prev = 0;
         for (size_t i = 0; i < frames; ++i) {
@@ -188,7 +197,7 @@ static void delta16_inverse(int16_t* s, size_t frames, int ch) {
 }
 
 
-/* ---------- Helpers LE ---------- */
+
 static void wr16le(uint8_t* p, uint16_t v) {
     p[0] = v & 0xFF;
     p[1] = (v >> 8) & 0xFF;
@@ -214,6 +223,7 @@ static uint32_t rd32le(const uint8_t* p) {
 
 /* ---------- Formato legible de tamaño ---------- */
 static void human_readable(size_t bytes, char* out, size_t out_size) {
+    /* Convierte bytes a formato amigable (ej: 1.23MB) */
     const char* u[] = {"B","KB","MB","GB","TB"};
     double v = (double)bytes;
     int i = 0;
@@ -224,32 +234,23 @@ static void human_readable(size_t bytes, char* out, size_t out_size) {
     snprintf(out, out_size, "%.2f%s", v, u[i]);
 }
 
-/* ---------- Ejecutar una tarea (archivo) ---------- */
-/* (Implementación única más abajo en "Estructura de Tarea") */
 
-/*************************************************************
- *                     FIN PARTE 2
- *************************************************************/
-/*************************************************************
- *                 GSEA MAIN (PARTE 3)
- *    Compresión por chunks + proceso completo
- *************************************************************/
 
-/* ---------- Compresión chunked (16 MB) ---------- */
 static int compress_chunked(const Config* cfg,
                             const uint8_t* in, size_t in_len,
                             uint8_t** out, size_t* out_len)
 {
     const size_t CH = cfg->chunk_bytes;
+    /* Si el archivo supera un chunk se usa versión paralela; si no, bucle único. */
 
-    /* Ahora SIEMPRE paraleliza si hay más de 1 chunk (auto usa CPUs) */
+   
     if (in_len > CH) {
         return compress_chunked_parallel(cfg, in, in_len, out, out_len);
     }
 
     size_t pos = 0;
 
-    // Prealocar: peor caso, expansión ≈ input
+    
     size_t cap = in_len ? in_len : 1;
     *out = (uint8_t*)malloc(cap);
     if (!*out) return -1;
@@ -312,13 +313,14 @@ static int compress_chunked(const Config* cfg,
     return 0;
 }
 
-/* ---------- Descompresión chunked (usa tamaño configurable) ---------- */
+/* ---------- Descompresión por chunks ---------- */
 static int decompress_chunked(const Config* cfg,
                               const uint8_t* in, size_t in_len,
                               uint8_t** out, size_t* out_len)
 {
     const size_t CH = cfg->chunk_bytes;
     size_t pos = 0;
+    /* Descomprime en bloques y reconstruye en un único buffer final */
 
     *out = NULL; *out_len = 0;
 
@@ -356,15 +358,14 @@ static int decompress_chunked(const Config* cfg,
     return 0;
 }
 
-/* ============================================================= */
-/*                    process_one_file COMPLETO                   */
-/* ============================================================= */
+/* ---------- Pipeline principal: procesa un archivo completo ---------- */
 
 static int process_one_file(const char* in, const char* out,
                             const Config* cfg,
                             size_t* o_orig, size_t* o_fin, double* o_ms)
 {
     JLOG(&cfg->journal, "\n[JOURNAL] Leyendo archivo: %s\n", in);
+    /* Etapas: leer -> (compresión) -> (cifrado) -> (descifrado) -> (descompresión) -> guardar */
 
     uint8_t* buf = NULL;
     size_t len = 0;
@@ -390,6 +391,7 @@ static int process_one_file(const char* in, const char* out,
         (cfg->comp_alg == COMP_DELTA16_LZW ||
          cfg->comp_alg == COMP_DELTA16_HUFF))
     {
+        /* Detectar WAV y convertir a muestras para aplicar delta16 */
         if (wav_is_riff_wave(buf, len)) {
             int16_t* samples = NULL;
             if (wav_decode_pcm16(buf, len, &samples,
@@ -414,6 +416,7 @@ static int process_one_file(const char* in, const char* out,
             cfg->comp_alg == COMP_DELTA16_HUFF)
         {
             if (is_wav_pcm16) {
+                /* Aplicar delta y empaquetar con cabecera simple */
                 delta16_forward((int16_t*)buf, wav_frames, wav_ch);
 
                 int rc;
@@ -468,6 +471,7 @@ ENCRYPT:
     /* ========== CIFRADO ========== */
     if (cfg->do_e) {
         JLOG(&cfg->journal, "[JOURNAL] Cifrando...\n");
+        /* Cifrado en memoria: Vigenere XOR simple o AES */
 
         if (cfg->enc_alg == ENC_VIG) {
             vigenere_encrypt(buf, len, (uint8_t*)cfg->key, strlen(cfg->key));
@@ -489,6 +493,7 @@ ENCRYPT:
     /* ========== DESCIFRADO ========== */
     if (cfg->do_u) {
         JLOG(&cfg->journal, "[JOURNAL] Descifrando...\n");
+        /* Inverso del paso anterior si fue solicitado */
         if (cfg->enc_alg == ENC_VIG) {
             vigenere_decrypt(buf, len,
                              (uint8_t*)cfg->key, strlen(cfg->key));
@@ -509,6 +514,7 @@ ENCRYPT:
     /* ========== DESCOMPRESIÓN ========== */
     if (cfg->do_d) {
         JLOG(&cfg->journal, "[JOURNAL] Descomprimiendo...\n");
+        /* Si es delta16 reconstruir WAV, si no descompresión chunked normal */
 
         /* WAV delta16 */
         if (cfg->comp_alg == COMP_DELTA16_LZW ||
@@ -575,6 +581,7 @@ ENCRYPT:
 
 SAVE:
     JLOG(&cfg->journal, "[JOURNAL] Guardando en %s\n", out);
+    /* Escribe resultado final a disco y mide tiempo total */
 
     int wres = write_file(out, buf, len);
 
@@ -589,26 +596,22 @@ SAVE:
     return wres;
 }
 
-/*************************************************************
- *                     FIN PARTE 3
- *************************************************************/
-/* ---------- Macro simple de journaling ---------- */
+/* ---------- Macro de journaling ---------- */
 #ifndef JPRINT
 #define JPRINT(...) \
     do { if (cfg->journaling) { fprintf(stderr, __VA_ARGS__); } } while (0)
 #endif
 
-/*************************************************************
- *              LISTA DE OPCIONES PARA GETOPT
- *************************************************************/
+/* ---------- Análisis de argumentos ---------- */
 
 static int parse_args(int argc, char* argv[], Config* cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
     cfg->comp_alg = COMP_RLEVAR;
     cfg->enc_alg  = ENC_VIG;
+    /* workers/inner_workers = 0 => auto-detectar núcleos */
 
-    /* 0 = auto (detecta CPUs). Antes era 4/1 fijos. */
+    
     cfg->workers = 0;
     cfg->inner_workers = 0;
     cfg->chunk_bytes = (size_t)DEFAULT_CHUNK_MB * 1024ull * 1024ull;
@@ -619,9 +622,9 @@ static int parse_args(int argc, char* argv[], Config* cfg)
         {"comp-alg",      required_argument, 0, 1},
         {"enc-alg",       required_argument, 0, 2},
         {"journal",       no_argument,       0, 3},
-        {"workers",       required_argument, 0, 4}, // ← NUEVO
-        {"inner-workers", required_argument, 0, 5}, // ← NUEVO
-        {"chunk-mb",      required_argument, 0, 6}, // ← NUEVO
+        {"workers",       required_argument, 0, 4}, 
+        {"inner-workers", required_argument, 0, 5}, 
+        {"chunk-mb",      required_argument, 0, 6}, 
         {0,0,0,0}
     };
 
@@ -637,7 +640,7 @@ static int parse_args(int argc, char* argv[], Config* cfg)
             case 'k': cfg->key      = optarg; break;
             case 'j': journal_set_enabled(&cfg->journal, 1); break;
 
-            case 1: /* --comp-alg */
+            case 1: 
                 if      (strcmp(optarg, "rlevar") == 0)        cfg->comp_alg = COMP_RLEVAR;
                 else if (strcmp(optarg, "lzw") == 0)           cfg->comp_alg = COMP_LZW;
                 else if (strcmp(optarg, "lzw-pred") == 0)      cfg->comp_alg = COMP_LZWPRED;
@@ -650,7 +653,7 @@ static int parse_args(int argc, char* argv[], Config* cfg)
                 }
                 break;
 
-            case 2: /* --enc-alg */
+            case 2: 
                 if      (strcmp(optarg, "none") == 0)     cfg->enc_alg = ENC_NONE;
                 else if (strcmp(optarg, "vigenere") == 0) cfg->enc_alg = ENC_VIG;
                 else if (strcmp(optarg, "aes") == 0)      cfg->enc_alg = ENC_AES;
@@ -662,7 +665,7 @@ static int parse_args(int argc, char* argv[], Config* cfg)
 
             case 3: journal_set_enabled(&cfg->journal, 1); break;
 
-            case 4: /* --workers */
+            case 4:
                 if (strcmp(optarg, "auto")==0) cfg->workers = 0;
                 else {
                     cfg->workers = atoi(optarg);
@@ -671,7 +674,7 @@ static int parse_args(int argc, char* argv[], Config* cfg)
                 }
                 break;
 
-            case 5: /* --inner-workers */
+            case 5: 
                 if (strcmp(optarg, "auto")==0) cfg->inner_workers = 0;
                 else {
                     cfg->inner_workers = atoi(optarg);
@@ -680,7 +683,7 @@ static int parse_args(int argc, char* argv[], Config* cfg)
                 }
                 break;
 
-            case 6: /* --chunk-mb */
+            case 6: 
                 {
                     long mb = atol(optarg);
                     if (mb < 1) mb = 1;
@@ -716,22 +719,23 @@ static int parse_args(int argc, char* argv[], Config* cfg)
 
     return 0;
 }
-/*************************************************************
- *                     PARTE 5 — MAIN COMPLETO
- *************************************************************/
+
 
 /* ---------- Helpers para archivos ---------- */
 static int is_regular(const char* p) {
+    /* Devuelve 1 si es archivo regular */
     struct stat st;
     return (stat(p, &st) == 0 && S_ISREG(st.st_mode));
 }
 
 static int is_dir(const char* p) {
+    /* Devuelve 1 si es carpeta */
     struct stat st;
     return (stat(p, &st) == 0 && S_ISDIR(st.st_mode));
 }
 
 static char* join_path(const char* a, const char* b) {
+    /* Une directorios asegurando slash */
     size_t na = strlen(a), nb = strlen(b);
     int need_slash = (na > 0 && a[na - 1] != '/');
     char* r = malloc(na + nb + 2);
@@ -752,6 +756,7 @@ typedef struct {
 } FileList;
 
 static void fl_init(FileList* fl) {
+    /* Inicializa lista dinámica de archivos */
     fl->count = 0;
     fl->cap = 32;
     fl->in = malloc(sizeof(char*) * fl->cap);
@@ -759,6 +764,7 @@ static void fl_init(FileList* fl) {
 }
 
 static void fl_push(FileList* fl, char* in, char* out) {
+    /* Agrega archivo (expande si hace falta) */
     if (fl->count == fl->cap) {
         fl->cap *= 2;
         fl->in = realloc(fl->in, sizeof(char*) * fl->cap);
@@ -770,6 +776,7 @@ static void fl_push(FileList* fl, char* in, char* out) {
 }
 
 static void fl_free(FileList* fl) {
+    /* Libera toda la lista y rutas */
     for (size_t i = 0; i < fl->count; i++) {
         free(fl->in[i]);
         free(fl->out[i]);
@@ -793,6 +800,7 @@ typedef struct {
 } Task;
 
 static void task_run(void* arg) {
+    /* Ejecuta la tarea de proceso para un archivo */
     Task* t = arg;
     t->rc = process_one_file(
         t->in,
@@ -808,6 +816,7 @@ static void task_run(void* arg) {
  *                 MODO INTERACTIVO
  *************************************************************/
 static const char* choose_comp_alg() {
+    /* Pregunta por algoritmo de compresión y devuelve texto */
     printf("Algoritmo de compresión:\n");
     printf(" 1) rlevar\n");
     printf(" 2) lzw\n");
@@ -846,6 +855,7 @@ static const char* choose_enc_alg() {
 }
 
 static int run_interactive() {
+    /* Construye un comando equivalente usando opciones elegidas por el usuario */
     char in[512], out[512], key[512];
 
     printf("Ruta de entrada: ");
@@ -863,7 +873,7 @@ static int run_interactive() {
     int op;
     scanf("%d", &op);
 
-    /* Construcción del comando */
+    
     char cmd[2048] = "./gsea ";
 
     if (op == 1 || op == 3) strcat(cmd, "-c ");
@@ -871,7 +881,7 @@ static int run_interactive() {
     if (op == 4 || op == 6) strcat(cmd, "-d ");
     if (op == 5 || op == 6) strcat(cmd, "-u ");
 
-    /* compresión si aplica */
+    
     if (op == 1 || op == 3 || op == 4 || op == 6) {
         const char* c = choose_comp_alg();
         strcat(cmd, "--comp-alg ");
@@ -879,7 +889,7 @@ static int run_interactive() {
         strcat(cmd, " ");
     }
 
-    /* cifrado si aplica */
+    
     if (op == 2 || op == 3 || op == 5 || op == 6) {
         const char* e = choose_enc_alg();
         strcat(cmd, "--enc-alg ");
@@ -895,7 +905,7 @@ static int run_interactive() {
         }
     }
 
-    /* nuevo: preguntar por journaling */
+    
     printf("¿Activar journaling (paso a paso)? [s/N]: ");
     char jopt = 'n';
     scanf(" %c", &jopt);
@@ -930,6 +940,7 @@ int main(int argc, char* argv[])
 
     /* Si es archivo único */
     if (!isFolder) {
+        /* Modo archivo único (sin pool externo) */
         printf("Procesando archivo único...\n");
 
         Task t = {
@@ -956,6 +967,7 @@ int main(int argc, char* argv[])
 
     /* Si es carpeta */
     printf("Procesando carpeta con hilos...\n");
+    /* Modo carpeta: lista archivos regulares y usa thread pool externo */
 
     FileList fl;
     fl_init(&fl);
@@ -984,6 +996,7 @@ int main(int argc, char* argv[])
 
     /* Pool externo con N trabajadores parametrizable */
     size_t outer = (cfg.workers > 0) ? (size_t)cfg.workers : (size_t)hw_threads();
+    /* outer = hilos para archivos; inner (cfg->inner_workers) se usa dentro de compresión chunked */
     ThreadPool* tp = tp_create(outer);
     JLOG(&cfg.journal, "[JOURNAL] Pool externo: %zu hilos, inner: %d, chunk: %zu MB\n",
          outer, (cfg.inner_workers>0?cfg.inner_workers:hw_threads()), cfg.chunk_bytes/(1024*1024));
@@ -1036,6 +1049,7 @@ int main(int argc, char* argv[])
 
 /* ---------- Helpers para cantidad de hilos ---------- */
 static int hw_threads(void) {
+    /* Obtiene núcleos lógicos disponibles (con límites) */
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     if (n <= 0) return 4;
     if (n > 128) n = 128;
@@ -1054,6 +1068,7 @@ typedef struct {
 } ChunkTask;
 
 static void compress_chunk_worker(void* arg) {
+    /* Comprime 1 chunk (posible predictor) y guarda resultado */
     ChunkTask* ct = (ChunkTask*)arg;
     const uint8_t* p = ct->in; size_t n = ct->len;
     uint8_t* bout = NULL; size_t blen = 0; int rc = 0;
@@ -1080,6 +1095,7 @@ static int compress_chunked_parallel(const Config* cfg,
                                      const uint8_t* in, size_t in_len,
                                      uint8_t** out, size_t* out_len)
 {
+    /* Divide archivo en chunks y los procesa con hilos internos, luego concatena */
     const size_t CH = cfg->chunk_bytes;
     size_t n_chunks = (in_len + CH - 1) / CH;
 
